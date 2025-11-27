@@ -144,6 +144,7 @@ class MultiAgentOrchestrator:
     def save_shared_state(self) -> None:
         """Save shared state to file."""
         try:
+            state_json = json.dumps(self.shared_state, indent=2)
             # Create directory first
             dir_path = os.path.dirname(self.shared_state_path)
             result = self.workspace.execute_command(f"mkdir -p {dir_path}")

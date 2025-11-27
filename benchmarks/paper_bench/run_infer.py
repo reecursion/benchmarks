@@ -12,6 +12,9 @@ import shutil
 import tempfile
 from pathlib import Path
 
+import httpx
+from urllib.parse import quote
+
 from openhands.sdk import LLM, get_logger
 from openhands.sdk.workspace import RemoteWorkspace
 from openhands.workspace import DockerWorkspace
@@ -28,6 +31,7 @@ logger = get_logger(__name__)
 # Image configuration
 BASE_IMAGE = "leandermaben7/pb-env:1.0.0"
 BUILD_TARGET = "source"
+TRANSFER_DIR = "/workspace/.transfer"
 
 
 def extract_custom_tag(base_image: str) -> str:
@@ -142,7 +146,11 @@ git checkout main
     if result.exit_code != 0:
         logger.error(f"Failed to copy files: {result.stderr}")
         raise RuntimeError(f"Failed to copy files: {result.stderr}")
-
+    
+    # Step 5: Verify files and check for LFS pointers
+    verify_result = workspace.execute_command("ls -la /workspace/paper/ | head -20")
+    file_list = verify_result.stdout if verify_result.exit_code == 0 else ""
+    
     # Check if paper.md has actual content or is an LFS pointer
     check_content = workspace.execute_command("head -5 /workspace/paper/paper.md 2>&1 || echo 'file not found'")
     logger.info(f"Checking paper.md content (first 5 lines):\n{check_content.stdout[:200]}")
@@ -268,6 +276,100 @@ async def run_multi_agent_inference(
     return result
 
 
+def download_remote_file(
+    workspace: RemoteWorkspace,
+    remote_path: str,
+    local_path: str,
+    timeout: float = 60.0,
+) -> bool:
+    """Download a file from the remote workspace with redirect-safe fallback."""
+    try:
+        client = getattr(workspace, "client", None)
+        if client is None:
+            raise RuntimeError("Workspace client unavailable for file download")
+
+        encoded_path = quote(remote_path, safe="")
+        request = client.build_request(
+            "GET",
+            f"/api/file/download/{encoded_path}",
+            timeout=timeout,
+        )
+        response = client.send(request, follow_redirects=True)
+        response.raise_for_status()
+
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        with open(local_path, "wb") as f:
+            f.write(response.content)
+        logger.info(f"Downloaded {remote_path} via agent-server API")
+        return True
+    except Exception as error:
+        logger.error(
+            "File download failed for %s: %s",
+            remote_path,
+            error,
+        )
+        return False
+
+
+def extract_logs_from_container(
+    workspace: RemoteWorkspace, output_dir: str, container_log_dir: str = "/workspace/logs/completions"
+) -> None:
+    """
+    Extract LLM completion logs from workspace container to host.
+
+    Args:
+        workspace: The workspace
+        output_dir: Directory on host to save logs
+        container_log_dir: Path to logs directory inside container
+    """
+    logger.info(f"Extracting completion logs from container: {container_log_dir}")
+
+    try:
+        workspace.execute_command(f"mkdir -p {TRANSFER_DIR}")
+        # Check if log directory exists and has files
+        result = workspace.execute_command(f"find {container_log_dir} -type f -name '*.json' 2>/dev/null | wc -l")
+        if result.exit_code != 0 or not result.stdout.strip().isdigit():
+            logger.warning(f"Could not check log directory: {result.stderr}")
+            return
+        
+        file_count = int(result.stdout.strip())
+        if file_count == 0:
+            logger.info("No completion logs found in container")
+            return
+        
+        logger.info(f"Found {file_count} completion log files in container")
+
+        # Create tar archive of logs
+        archive_path = f"{TRANSFER_DIR}/completion_logs.tar.gz"
+        archive_cmd = f"cd {container_log_dir} && tar -czf {archive_path} . 2>&1"
+        archive_result = workspace.execute_command(archive_cmd)
+        if archive_result.exit_code != 0:
+            logger.error(f"Failed to create logs archive: {archive_result.stderr}")
+            return
+        
+        # Download the archive
+        local_archive_path = os.path.join(output_dir, "completion_logs.tar.gz")
+        os.makedirs(output_dir, exist_ok=True)
+        if not download_remote_file(workspace, archive_path, local_archive_path):
+            logger.error("Failed to download logs archive via workspace APIs")
+            return
+        
+        # Extract locally
+        import tarfile
+        try:
+            with tarfile.open(local_archive_path, "r:gz") as tar:
+                tar.extractall(path=output_dir)
+            logger.info(f"✅ Extracted {file_count} completion logs to {output_dir}")
+            
+            # Remove the tar archive after extraction
+            os.remove(local_archive_path)
+        except tarfile.TarError as e:
+            logger.error(f"Failed to extract logs archive: {e}")
+            
+    except Exception as e:
+        logger.warning(f"Failed to extract completion logs: {e}")
+
+
 def extract_submission(
     workspace: RemoteWorkspace, submission_dir: str, task_name: str
 ) -> None:
@@ -288,18 +390,54 @@ def extract_submission(
 
     # Copy submission from workspace
     try:
+        workspace.execute_command(f"mkdir -p {TRANSFER_DIR}")
         # List files in submission directory
         result = workspace.execute_command("find /workspace/submission -type f 2>/dev/null || true")
         if result.exit_code == 0:
             files = [f for f in result.stdout.strip().split("\n") if f]
             logger.info(f"Found {len(files)} files in submission directory")
+            
+            if not files:
+                logger.warning("No files found in submission directory")
+                return
 
-            # Create tar archive
-            archive_command = "cd /workspace/submission && tar -czf /tmp/submission.tar.gz . 2>/dev/null || true"
+            # Create tar archive in the container
+            archive_path = f"{TRANSFER_DIR}/submission.tar.gz"
+            archive_command = f"cd /workspace/submission && tar -czf {archive_path} . 2>&1"
             archive_result = workspace.execute_command(archive_command)
-            if archive_result.exit_code == 0:
-                logger.info("Created submission archive")
-                # Note: Download tar file
+            if archive_result.exit_code != 0:
+                logger.error(f"Failed to create submission archive: {archive_result.stderr}")
+                return
+            logger.info("Created submission archive in container")
+
+            # Download the tar archive from container to host
+            local_archive_path = os.path.join(task_submission_dir, "submission.tar.gz")
+            if not download_remote_file(workspace, archive_path, local_archive_path):
+                logger.error("Failed to download submission archive via workspace APIs")
+                return
+            logger.info(f"Downloaded submission archive to {local_archive_path}")
+
+            # Extract the tar archive locally
+            import tarfile
+            try:
+                with tarfile.open(local_archive_path, "r:gz") as tar:
+                    tar.extractall(path=task_submission_dir)
+                logger.info(f"Extracted submission files to {task_submission_dir}")
+                
+                # Remove the tar archive after extraction
+                os.remove(local_archive_path)
+                
+                # List extracted files
+                extracted_files = []
+                for root, dirs, filenames in os.walk(task_submission_dir):
+                    for filename in filenames:
+                        rel_path = os.path.relpath(os.path.join(root, filename), task_submission_dir)
+                        extracted_files.append(rel_path)
+                logger.info(f"Extracted {len(extracted_files)} files: {extracted_files[:10]}{'...' if len(extracted_files) > 10 else ''}")
+                
+            except tarfile.TarError as e:
+                logger.error(f"Failed to extract submission archive: {e}")
+                
     except Exception as e:
         logger.warning(f"Failed to extract submission: {e}")
 
@@ -380,24 +518,19 @@ def main() -> None:
         eval_note=args.note,
     )
     
-    # Enable API call logging if requested
+    # Configure API call logging
+    # Logs are written inside the Docker container and copied back after inference
+    container_log_dir = "/workspace/logs/completions"  # Path inside Docker
+    host_log_dir = args.log_completions_dir
+    if host_log_dir is None:
+        host_log_dir = os.path.join(structured_output_dir, "logs", "completions")
+    
     if args.log_completions:
-        log_completions_dir = args.log_completions_dir
-        if log_completions_dir is None:
-            log_completions_dir = os.path.join(structured_output_dir, "logs", "completions")
-        
-        # Create the directory NOW before any LLM calls
-        os.makedirs(log_completions_dir, exist_ok=True)
-        
-        # Verify it exists and is writable
-        if not os.path.isdir(log_completions_dir):
-            logger.warning(f"Failed to create log directory: {log_completions_dir}")
-            logger.info("ℹ️  API call logging disabled due to directory creation failure")
-        else:
-            llm.log_completions = True
-            llm.log_completions_folder = log_completions_dir
-            logger.info(f"✅ API call logging enabled: {log_completions_dir}")
-            logger.info(f"   All LLM API requests and responses will be saved as JSON files")
+        # Enable logging inside the Docker container
+        llm.log_completions = True
+        llm.log_completions_folder = container_log_dir
+        logger.info(f"✅ API call logging enabled (inside container: {container_log_dir})")
+        logger.info(f"   Logs will be copied to host at: {host_log_dir}")
     else:
         logger.info("ℹ️  API call logging disabled (use --log-completions to enable)")
     
@@ -431,6 +564,11 @@ def main() -> None:
 
     # Run inference using workspace context manager (synchronous)
     with workspace:
+        # Create log directory inside container if logging is enabled
+        if args.log_completions:
+            workspace.execute_command(f"mkdir -p {container_log_dir}")
+            logger.info(f"Created log directory in container: {container_log_dir}")
+        
         # Initialize task environment
         init_task_environment(workspace, args.task_name, instructions_path)
 
@@ -465,6 +603,10 @@ RUBRICEOF'''
 
         # Extract submission
         extract_submission(workspace, args.submission_dir, args.task_name)
+        
+        # Extract completion logs from container if logging was enabled
+        if args.log_completions:
+            extract_logs_from_container(workspace, host_log_dir, container_log_dir)
 
         # Save results
         results_file = os.path.join(structured_output_dir, "results.json")
@@ -476,10 +618,7 @@ RUBRICEOF'''
         
         # Log completion log location if enabled
         if args.log_completions:
-            log_completions_dir = args.log_completions_dir
-            if log_completions_dir is None:
-                log_completions_dir = os.path.join(structured_output_dir, "logs", "completions")
-            logger.info(f"📝 API call logs saved to: {log_completions_dir}")
+            logger.info(f"📝 API call logs saved to: {host_log_dir}")
             logger.info(f"   Each API request/response is saved as a separate JSON file")
 
     logger.info("Inference completed!")

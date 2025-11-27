@@ -70,6 +70,9 @@ You should use HuggingFace Transformers, PyTorch, and the datasets library where
         paper_path = context.get("paper_path", "/home/paper")
         submission_path = context.get("submission_path", "/home/submission")
 
+        # Get infrastructure output
+        infra_output = self._get_previous_agent_output("infrastructure")
+
         return f"""You are the Model & Dataset Agent for reproducing the paper at {paper_path}.
 
 Task: {task_desc}
@@ -109,6 +112,9 @@ You should write clean, well-documented code that matches the paper's methodolog
         task_desc = context.get("task", "Implement methods")
         paper_path = context.get("paper_path", "/home/paper")
         submission_path = context.get("submission_path", "/home/submission")
+
+        # Get previous agent outputs
+        model_dataset_output = self._get_previous_agent_output("model_dataset")
 
         return f"""You are the Method Implementation Agent for reproducing the paper at {paper_path}.
 
@@ -150,6 +156,9 @@ You should create comprehensive configuration files that match the paper's exper
         paper_path = context.get("paper_path", "/home/paper")
         submission_path = context.get("submission_path", "/home/submission")
 
+        # Get previous agent outputs
+        method_output = self._get_previous_agent_output("method_implementation")
+
         return f"""You are the Experiment Config Agent for reproducing the paper at {paper_path}.
 
 Task: {task_desc}
@@ -188,6 +197,9 @@ You should run experiments efficiently and handle errors gracefully.
         task_desc = context.get("task", "Run experiments")
         paper_path = context.get("paper_path", "/home/paper")
         submission_path = context.get("submission_path", "/home/submission")
+
+        # Get previous agent outputs
+        config_output = self._get_previous_agent_output("experiment_config")
 
         return f"""You are the Experiment Execution Agent for reproducing the paper at {paper_path}.
 
@@ -228,6 +240,9 @@ You should calculate all metrics mentioned in the paper and validate their corre
         task_desc = context.get("task", "Calculate metrics")
         paper_path = context.get("paper_path", "/home/paper")
         submission_path = context.get("submission_path", "/home/submission")
+
+        # Get previous agent outputs
+        execution_output = self._get_previous_agent_output("experiment_execution")
 
         return f"""You are the Metrics & Evaluation Agent for reproducing the paper at {paper_path}.
 
@@ -287,6 +302,9 @@ Example: If you find a metric calculation error, request:
         paper_path = context.get("paper_path", "/home/paper")
         submission_path = context.get("submission_path", "/home/submission")
 
+        # Get previous agent outputs
+        metrics_output = self._get_previous_agent_output("metrics_evaluation")
+
         return f"""You are the Result Analysis Agent for reproducing the paper at {paper_path}.
 
 Task: {task_desc}
@@ -328,6 +346,9 @@ You should create clear, comprehensive documentation of the reproduction effort.
         task_desc = context.get("task", "Generate reports")
         paper_path = context.get("paper_path", "/home/paper")
         submission_path = context.get("submission_path", "/home/submission")
+
+        # Get previous agent outputs
+        analysis_output = self._get_previous_agent_output("result_analysis")
 
         return f"""You are the Reporting Agent for reproducing the paper at {paper_path}.
 
