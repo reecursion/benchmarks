@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 from openhands.sdk import Agent, Conversation, get_logger
 from openhands.sdk.workspace import RemoteWorkspace
 
+
 logger = get_logger(__name__)
 
 
@@ -19,7 +20,7 @@ class AgentState:
     submission_path: str
     agents_completed: List[str] = field(default_factory=list)
     agent_outputs: Dict[str, Any] = field(default_factory=dict)
-    errors: List[Dict[str, str]] = field(default_factory=dict)
+    errors: List[Dict[str, str]] = field(default_factory=list)
     models_loaded: List[str] = field(default_factory=list)
     datasets_loaded: List[str] = field(default_factory=list)
     methods_implemented: List[str] = field(default_factory=list)
@@ -98,8 +99,46 @@ class BaseAgent(ABC):
             system_prompt = self.get_system_prompt(context)
             instruction = self.get_instruction(context)
 
-            # Build full instruction with system context
-            full_instruction = f"""{system_prompt}
+            # Check if this is a refinement iteration
+            refinement_feedback = context.get("refinement_feedback")
+
+            if refinement_feedback:
+                # Add refinement feedback to instruction
+                iteration = refinement_feedback.get("iteration", 1)
+                issues = refinement_feedback.get("specific_issues", [])
+                suggestions = refinement_feedback.get("suggestions", [])
+
+                refinement_context = f"""
+
+🔄 REFINEMENT ITERATION #{iteration}
+
+Your previous attempt was reviewed and needs improvement. Please address the following issues:
+
+SPECIFIC ISSUES TO FIX:
+"""
+                for i, issue in enumerate(issues, 1):
+                    refinement_context += f"{i}. {issue}\n"
+
+                if suggestions:
+                    refinement_context += "\nSUGGESTED IMPROVEMENTS:\n"
+                    for i, suggestion in enumerate(suggestions, 1):
+                        refinement_context += f"{i}. {suggestion}\n"
+
+                refinement_context += """
+Please focus on addressing these specific issues in your revised work. Learn from the previous attempt and improve upon it.
+"""
+
+                full_instruction = f"""{system_prompt}
+
+{instruction}
+
+{refinement_context}
+
+Please work on this task step by step. Document your progress and save any outputs to the appropriate locations.
+"""
+            else:
+                # Build full instruction with system context
+                full_instruction = f"""{system_prompt}
 
 {instruction}
 
@@ -119,7 +158,7 @@ Please work on this task step by step. Document your progress and save any outpu
             conversation.run()
 
             # Extract results from conversation
-            result = self._extract_results(conversation, context)
+            result = self._extract_results(conversation, context)  # type: ignore[arg-type]
 
             logger.info(f"Agent {self.name} completed successfully")
             return {
@@ -152,7 +191,7 @@ Please work on this task step by step. Document your progress and save any outpu
             Dictionary with extracted results (may include callback_agent and callback_reason)
         """
         # Extract information from conversation events
-        events = conversation.state.events
+        events = conversation.state.events  # type: ignore[attr-defined]
         result = {
             "events_count": len(events),
             "last_messages": [],
@@ -170,24 +209,26 @@ Please work on this task step by step. Document your progress and save any outpu
         # Parse callback requests from agent messages
         callback_agent = None
         callback_reason = None
-        
+
         # Look through all events for callback requests
         for event in reversed(events):  # Start from most recent
             event_str = str(event)
-            
+
             # Check for callback request
             if "CALLBACK_REQUEST:" in event_str:
-                lines = event_str.split('\n')
+                lines = event_str.split("\n")
                 for line in lines:
                     if "CALLBACK_REQUEST:" in line:
                         callback_agent = line.split("CALLBACK_REQUEST:")[-1].strip()
                     if "CALLBACK_REASON:" in line:
                         callback_reason = line.split("CALLBACK_REASON:")[-1].strip()
-                
+
                 if callback_agent:
                     result["callback_agent"] = callback_agent
                     result["callback_reason"] = callback_reason or "No reason provided"
-                    logger.info(f"🔄 Agent {self.name} requests callback to {callback_agent}")
+                    logger.info(
+                        f"🔄 Agent {self.name} requests callback to {callback_agent}"
+                    )
                     break
 
         return result
@@ -200,4 +241,3 @@ Please work on this task step by step. Document your progress and save any outpu
         """Get output from a previous agent."""
         agent_outputs = self.shared_state.get("agent_outputs", {})
         return agent_outputs.get(agent_name)
-

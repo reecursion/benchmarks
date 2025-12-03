@@ -22,6 +22,7 @@ Multi-agent system for reproducing research papers using OpenHands and the `lean
 
 The system will automatically build the Docker image on first run (takes 5-10 minutes):
 
+**With Critic Agent (Default - Recommended):**
 ```bash
 cd /Users/gayathrigl/Desktop/capstone/benchmarks
 
@@ -33,19 +34,31 @@ uv run python -m benchmarks.paper_bench.run_infer \
     --max-iterations-per-agent 50
 ```
 
+**Without Critic (Faster, Lower Quality):**
+```bash
+uv run python -m benchmarks.paper_bench.run_infer \
+    .llm_config/gpt-3.5-turbo.json \
+    --output-dir ./outputs \
+    --task-name pinn \
+    --disable-critic
+```
+
 ### Command Options
 
 - `--task-name`: Paper name (see Available Papers below)
 - `--output-dir`: Output directory (default: `./outputs`)
 - `--max-iterations`: Total max iterations
 - `--max-iterations-per-agent`: Max iterations per agent (default: 50)
+- `--enable-critic`: Enable critic agent (default: True)
+- `--disable-critic`: Disable critic agent for faster execution
+- `--max-refinements`: Max refinement iterations per agent (default: 2)
 - `--instructions-path`: Path to instructions file (default: `benchmarks/paper_bench/instructions.md`)
 - `--rubric-path`: Optional path to rubric.json
 - `--log-completions`: Enable LLM API call logging
 
 ## Multi-Agent System
 
-The orchestrator coordinates 8 specialized agents in sequence:
+The orchestrator coordinates 8 specialized agents in sequence, with an optional **Critic Agent** for quality assurance:
 
 1. **Infrastructure Agent** - Environment setup, dependencies, GPU access
 2. **Model & Dataset Agent** - Load pre-trained models and datasets
@@ -55,6 +68,15 @@ The orchestrator coordinates 8 specialized agents in sequence:
 6. **Metrics & Evaluation Agent** - Calculate evaluation metrics
 7. **Result Analysis Agent** - Analyze results and validate against paper (can request callbacks)
 8. **Reporting Agent** - Generate reports and documentation
+
+### Critic Agent
+
+The **Critic Agent** reviews each agent's output for quality and provides iterative refinement:
+- Reviews outputs for completeness, correctness, and quality
+- Provides actionable feedback for improvement
+- Enables iterative refinement (default: 2 attempts per agent)
+- **Enabled by default** - use `--disable-critic` to turn off
+- See [CRITIC_AGENT_README.md](CRITIC_AGENT_README.md) for details
 
 ### Agent Callbacks
 

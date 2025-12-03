@@ -8,16 +8,8 @@ to reproduce research papers using the leandermaben7/pb-env:1.0.0 Docker image.
 import asyncio
 import json
 import os
-import shutil
-import tempfile
 from pathlib import Path
-
-import httpx
 from urllib.parse import quote
-
-from openhands.sdk import LLM, get_logger
-from openhands.sdk.workspace import RemoteWorkspace
-from openhands.workspace import DockerWorkspace
 
 from benchmarks.paper_bench.orchestrator import MultiAgentOrchestrator
 from benchmarks.utils.args_parser import get_parser
@@ -25,6 +17,10 @@ from benchmarks.utils.build_utils import build_image
 from benchmarks.utils.constants import EVAL_AGENT_SERVER_IMAGE
 from benchmarks.utils.evaluation_utils import construct_eval_output_dir
 from benchmarks.utils.version import SDK_SHORT_SHA
+from openhands.sdk import LLM, get_logger
+from openhands.sdk.workspace import RemoteWorkspace
+from openhands.workspace import DockerWorkspace
+
 
 logger = get_logger(__name__)
 
@@ -47,10 +43,12 @@ def get_config_for_task(
 ) -> DockerWorkspace:
     """Create workspace - builds image with --platform linux/amd64."""
     logger.info(f"Building agent-server image for task: {task_name}")
-    
+
     custom_tag = extract_custom_tag(base_image)
-    agent_server_image = f"{EVAL_AGENT_SERVER_IMAGE}:{SDK_SHORT_SHA}-{custom_tag}-{BUILD_TARGET}"
-    
+    agent_server_image = (
+        f"{EVAL_AGENT_SERVER_IMAGE}:{SDK_SHORT_SHA}-{custom_tag}-{BUILD_TARGET}"
+    )
+
     output = build_image(
         base_image=base_image,
         target_image=EVAL_AGENT_SERVER_IMAGE,
@@ -58,10 +56,10 @@ def get_config_for_task(
         target=BUILD_TARGET,
         push=False,
     )
-    
+
     if output.error:
         raise RuntimeError(f"Build failed: {output.error}")
-    
+
     return DockerWorkspace(
         server_image=agent_server_image,
         working_dir=workspace_dir,
@@ -83,10 +81,14 @@ def init_task_environment(
     logger.info(f"Initializing task environment for: {task_name}")
 
     # Create directories in workspace (which we have full control over)
-    workspace.execute_command("mkdir -p /workspace/paper /workspace/submission /workspace/shared_state")
-    
+    workspace.execute_command(
+        "mkdir -p /workspace/paper /workspace/submission /workspace/shared_state"
+    )
+
     # Clear paper directory if it exists (safer than rm -rf)
-    workspace.execute_command("rm -rf /workspace/paper/* /workspace/paper/.* 2>/dev/null || true")
+    workspace.execute_command(
+        "rm -rf /workspace/paper/* /workspace/paper/.* 2>/dev/null || true"
+    )
     workspace.execute_command("mkdir -p /workspace/paper")
 
     # Install git-lfs if not already installed (needed for cloning paper files)
@@ -102,22 +104,24 @@ def init_task_environment(
     '"""
     install_result = workspace.execute_command(install_cmd, timeout=60)
     if install_result.exit_code != 0:
-        logger.warning(f"git-lfs installation had issues: {install_result.stderr}, continuing anyway...")
+        logger.warning(
+            f"git-lfs installation had issues: {install_result.stderr}, continuing anyway..."
+        )
     else:
         logger.info("git-lfs ready")
-    
+
     # Clone paper files with proper Git LFS handling
     logger.info(f"Cloning paper files for {task_name}...")
-    
+
     # Step 1: Clone repository
-    clone_cmd = f"""rm -rf /tmp/frontier-evals && \\
+    clone_cmd = """rm -rf /tmp/frontier-evals && \\
 git clone --filter=blob:none --no-checkout https://github.com/openai/frontier-evals.git /tmp/frontier-evals
 """
     result = workspace.execute_command(clone_cmd)
     if result.exit_code != 0:
         logger.error(f"Failed to clone repository: {result.stderr}")
         raise RuntimeError(f"Failed to clone repository: {result.stderr}")
-    
+
     # Step 2: Set up sparse checkout and checkout files
     checkout_cmd = f"""cd /tmp/frontier-evals && \\
 git sparse-checkout init --cone && \\
@@ -128,7 +132,7 @@ git checkout main
     if result.exit_code != 0:
         logger.error(f"Failed to checkout files: {result.stderr}")
         raise RuntimeError(f"Failed to checkout files: {result.stderr}")
-    
+
     # Step 3: Install and use Git LFS to pull actual file content (not pointers)
     # Increase timeout to 300 seconds for large files
     lfs_cmd = f"""cd /tmp/frontier-evals && \\
@@ -138,7 +142,7 @@ git checkout main
     result = workspace.execute_command(lfs_cmd, timeout=150)
     if result.exit_code != 0:
         logger.warning(f"Git LFS pull had issues: {result.stderr}, continuing...")
-    
+
     # Step 4: Copy files to workspace
     copy_cmd = f"""cp -r /tmp/frontier-evals/project/paperbench/data/papers/{task_name}/* /workspace/paper/ 2>&1
 """
@@ -146,17 +150,22 @@ git checkout main
     if result.exit_code != 0:
         logger.error(f"Failed to copy files: {result.stderr}")
         raise RuntimeError(f"Failed to copy files: {result.stderr}")
-    
+
     # Step 5: Verify files and check for LFS pointers
-    verify_result = workspace.execute_command("ls -la /workspace/paper/ | head -20")
-    file_list = verify_result.stdout if verify_result.exit_code == 0 else ""
+    workspace.execute_command("ls -la /workspace/paper/ | head -20")
     
     # Check if paper.md has actual content or is an LFS pointer
-    check_content = workspace.execute_command("head -5 /workspace/paper/paper.md 2>&1 || echo 'file not found'")
-    logger.info(f"Checking paper.md content (first 5 lines):\n{check_content.stdout[:200]}")
-    
+    check_content = workspace.execute_command(
+        "head -5 /workspace/paper/paper.md 2>&1 || echo 'file not found'"
+    )
+    logger.info(
+        f"Checking paper.md content (first 5 lines):\n{check_content.stdout[:200]}"
+    )
+
     if "version https://git-lfs.github.com/spec/v1" in check_content.stdout:
-        logger.warning("⚠️  paper.md is a Git LFS pointer! Attempting to download actual content...")
+        logger.warning(
+            "paper.md is a Git LFS pointer! Attempting to download actual content..."
+        )
         # Try to get LFS files directly - use fetch then checkout (with longer timeout)
         lfs_fetch_cmd = f"""cd /tmp/frontier-evals && \\
 timeout 120 git lfs fetch --all 2>&1 && \\
@@ -168,39 +177,51 @@ cp -rf project/paperbench/data/papers/{task_name}/* /workspace/paper/ 2>&1
         logger.info(f"  stdout: {result.stdout[-300:] if result.stdout else 'empty'}")
         if result.stderr:
             logger.warning(f"  stderr: {result.stderr[-300:]}")
-        
+
         # Verify the file was replaced
-        check_again = workspace.execute_command("head -10 /workspace/paper/paper.md 2>&1")
+        check_again = workspace.execute_command(
+            "head -10 /workspace/paper/paper.md 2>&1"
+        )
         if "version https://git-lfs.github.com/spec/v1" not in check_again.stdout:
-            logger.info("✅ Git LFS files successfully downloaded - paper.md now has actual content")
+            logger.info(
+                "Git LFS files successfully downloaded - paper.md now has actual content"
+            )
         else:
-            logger.warning("⚠️  Git LFS files still not downloaded - paper.md is still a pointer")
-            logger.warning("The agent will work with available files (rubric.json, config.yaml, etc.)")
-    
+            logger.warning(
+                "Git LFS files still not downloaded - paper.md is still a pointer"
+            )
+            logger.warning(
+                "The agent will work with available files (rubric.json, config.yaml, etc.)"
+            )
+
     # Final verification with detailed logging
     file_count_result = workspace.execute_command("ls /workspace/paper | wc -l")
     file_count = 0
     if file_count_result.exit_code == 0 and file_count_result.stdout.strip().isdigit():
         file_count = int(file_count_result.stdout.strip())
-    
+
     # List all files with sizes
     file_list_cmd = workspace.execute_command("ls -lh /workspace/paper/ | tail -n +2")
     logger.info(f"📁 Files in /workspace/paper ({file_count} items):")
     if file_list_cmd.stdout:
-        for line in file_list_cmd.stdout.strip().split('\n')[:15]:  # Show first 15 files
+        for line in file_list_cmd.stdout.strip().split("\n")[
+            :15
+        ]:  # Show first 15 files
             logger.info(f"  {line}")
-    
+
     if file_count == 0:
-        logger.error(f"❌ No files found in /workspace/paper")
-        raise RuntimeError(f"Failed to set up paper files: No files found")
+        logger.error("No files found in /workspace/paper")
+        raise RuntimeError("Failed to set up paper files: No files found")
     else:
-        logger.info(f"✅ Paper files setup completed ({file_count} items)")
-        
+        logger.info(f"Paper files setup completed ({file_count} items)")
+
         # Check file sizes - LFS pointers are tiny (~100 bytes), real files are larger
-        size_check = workspace.execute_command("du -sh /workspace/paper/* 2>&1 | head -10")
+        size_check = workspace.execute_command(
+            "du -sh /workspace/paper/* 2>&1 | head -10"
+        )
         if size_check.stdout:
-            logger.info(f"📊 File sizes:")
-            for line in size_check.stdout.strip().split('\n')[:10]:
+            logger.info("File sizes:")
+            for line in size_check.stdout.strip().split("\n")[:10]:
                 logger.info(f"  {line}")
 
     # Copy instructions
@@ -215,9 +236,9 @@ cp -rf project/paperbench/data/papers/{task_name}/* /workspace/paper/ 2>&1
         if result.exit_code == 0:
             # Write instructions using heredoc
             result = workspace.execute_command(
-                f'''cat > {instructions_file} << 'INSTRUCTIONSEOF'
+                f"""cat > {instructions_file} << 'INSTRUCTIONSEOF'
 {instructions_content}
-INSTRUCTIONSEOF'''
+INSTRUCTIONSEOF"""
             )
             if result.exit_code == 0:
                 logger.info(f"Copied instructions to {instructions_file}")
@@ -238,6 +259,8 @@ async def run_multi_agent_inference(
     instructions_path: str = "/home/instructions.md",
     rubric_path: str | None = None,
     max_iterations_per_agent: int = 50,
+    enable_critic: bool = True,
+    max_refinements: int = 2,
 ) -> dict:
     """
     Run multi-agent inference for a paper reproduction task.
@@ -249,11 +272,19 @@ async def run_multi_agent_inference(
         instructions_path: Path to instructions file
         rubric_path: Optional path to rubric.json
         max_iterations_per_agent: Maximum iterations per agent
+        enable_critic: Whether to enable critic agent for quality review
+        max_refinements: Maximum refinement iterations per agent
 
     Returns:
         Dictionary with workflow results
     """
     logger.info(f"Starting multi-agent inference for task: {task_name}")
+    if enable_critic:
+        logger.info(
+            f"🔍 Critic agent enabled (max {max_refinements} refinements per agent)"
+        )
+    else:
+        logger.info("ℹ️  Critic agent disabled")
 
     # Initialize orchestrator
     orchestrator = MultiAgentOrchestrator(
@@ -263,6 +294,8 @@ async def run_multi_agent_inference(
         paper_path="/workspace/paper",
         submission_path="/workspace/submission",
         shared_state_path="/workspace/shared_state/shared_state.json",
+        enable_critic=enable_critic,
+        max_refinements=max_refinements,
     )
 
     # Run orchestrator
@@ -312,7 +345,9 @@ def download_remote_file(
 
 
 def extract_logs_from_container(
-    workspace: RemoteWorkspace, output_dir: str, container_log_dir: str = "/workspace/logs/completions"
+    workspace: RemoteWorkspace,
+    output_dir: str,
+    container_log_dir: str = "/workspace/logs/completions",
 ) -> None:
     """
     Extract LLM completion logs from workspace container to host.
@@ -327,16 +362,18 @@ def extract_logs_from_container(
     try:
         workspace.execute_command(f"mkdir -p {TRANSFER_DIR}")
         # Check if log directory exists and has files
-        result = workspace.execute_command(f"find {container_log_dir} -type f -name '*.json' 2>/dev/null | wc -l")
+        result = workspace.execute_command(
+            f"find {container_log_dir} -type f -name '*.json' 2>/dev/null | wc -l"
+        )
         if result.exit_code != 0 or not result.stdout.strip().isdigit():
             logger.warning(f"Could not check log directory: {result.stderr}")
             return
-        
+
         file_count = int(result.stdout.strip())
         if file_count == 0:
             logger.info("No completion logs found in container")
             return
-        
+
         logger.info(f"Found {file_count} completion log files in container")
 
         # Create tar archive of logs
@@ -346,26 +383,27 @@ def extract_logs_from_container(
         if archive_result.exit_code != 0:
             logger.error(f"Failed to create logs archive: {archive_result.stderr}")
             return
-        
+
         # Download the archive
         local_archive_path = os.path.join(output_dir, "completion_logs.tar.gz")
         os.makedirs(output_dir, exist_ok=True)
         if not download_remote_file(workspace, archive_path, local_archive_path):
             logger.error("Failed to download logs archive via workspace APIs")
             return
-        
+
         # Extract locally
         import tarfile
+
         try:
             with tarfile.open(local_archive_path, "r:gz") as tar:
                 tar.extractall(path=output_dir)
             logger.info(f"✅ Extracted {file_count} completion logs to {output_dir}")
-            
+
             # Remove the tar archive after extraction
             os.remove(local_archive_path)
         except tarfile.TarError as e:
             logger.error(f"Failed to extract logs archive: {e}")
-            
+
     except Exception as e:
         logger.warning(f"Failed to extract completion logs: {e}")
 
@@ -392,21 +430,27 @@ def extract_submission(
     try:
         workspace.execute_command(f"mkdir -p {TRANSFER_DIR}")
         # List files in submission directory
-        result = workspace.execute_command("find /workspace/submission -type f 2>/dev/null || true")
+        result = workspace.execute_command(
+            "find /workspace/submission -type f 2>/dev/null || true"
+        )
         if result.exit_code == 0:
             files = [f for f in result.stdout.strip().split("\n") if f]
             logger.info(f"Found {len(files)} files in submission directory")
-            
+
             if not files:
                 logger.warning("No files found in submission directory")
                 return
 
             # Create tar archive in the container
             archive_path = f"{TRANSFER_DIR}/submission.tar.gz"
-            archive_command = f"cd /workspace/submission && tar -czf {archive_path} . 2>&1"
+            archive_command = (
+                f"cd /workspace/submission && tar -czf {archive_path} . 2>&1"
+            )
             archive_result = workspace.execute_command(archive_command)
             if archive_result.exit_code != 0:
-                logger.error(f"Failed to create submission archive: {archive_result.stderr}")
+                logger.error(
+                    f"Failed to create submission archive: {archive_result.stderr}"
+                )
                 return
             logger.info("Created submission archive in container")
 
@@ -419,25 +463,30 @@ def extract_submission(
 
             # Extract the tar archive locally
             import tarfile
+
             try:
                 with tarfile.open(local_archive_path, "r:gz") as tar:
                     tar.extractall(path=task_submission_dir)
                 logger.info(f"Extracted submission files to {task_submission_dir}")
-                
+
                 # Remove the tar archive after extraction
                 os.remove(local_archive_path)
-                
+
                 # List extracted files
                 extracted_files = []
                 for root, dirs, filenames in os.walk(task_submission_dir):
                     for filename in filenames:
-                        rel_path = os.path.relpath(os.path.join(root, filename), task_submission_dir)
+                        rel_path = os.path.relpath(
+                            os.path.join(root, filename), task_submission_dir
+                        )
                         extracted_files.append(rel_path)
-                logger.info(f"Extracted {len(extracted_files)} files: {extracted_files[:10]}{'...' if len(extracted_files) > 10 else ''}")
-                
+                logger.info(
+                    f"Extracted {len(extracted_files)} files: {extracted_files[:10]}{'...' if len(extracted_files) > 10 else ''}"
+                )
+
             except tarfile.TarError as e:
                 logger.error(f"Failed to extract submission archive: {e}")
-                
+
     except Exception as e:
         logger.warning(f"Failed to extract submission: {e}")
 
@@ -476,6 +525,23 @@ def main() -> None:
         help="Maximum iterations per agent",
     )
     parser.add_argument(
+        "--enable-critic",
+        action="store_true",
+        default=True,
+        help="Enable critic agent for quality review and iterative refinement",
+    )
+    parser.add_argument(
+        "--disable-critic",
+        action="store_true",
+        help="Disable critic agent (faster but lower quality)",
+    )
+    parser.add_argument(
+        "--max-refinements",
+        type=int,
+        default=2,
+        help="Maximum refinement iterations per agent when critic is enabled",
+    )
+    parser.add_argument(
         "--log-completions",
         action="store_true",
         help="Enable logging of LLM API calls and responses to JSON files",
@@ -507,7 +573,7 @@ def main() -> None:
     with open(llm_config_path, "r") as f:
         llm_config = f.read()
     llm = LLM.model_validate_json(llm_config)
-    
+
     # Construct output directory
     dataset_description = f"paperbench-{args.task_name}"
     structured_output_dir = construct_eval_output_dir(
@@ -517,23 +583,25 @@ def main() -> None:
         max_iterations=args.max_iterations,
         eval_note=args.note,
     )
-    
+
     # Configure API call logging
     # Logs are written inside the Docker container and copied back after inference
     container_log_dir = "/workspace/logs/completions"  # Path inside Docker
     host_log_dir = args.log_completions_dir
     if host_log_dir is None:
         host_log_dir = os.path.join(structured_output_dir, "logs", "completions")
-    
+
     if args.log_completions:
         # Enable logging inside the Docker container
         llm.log_completions = True
         llm.log_completions_folder = container_log_dir
-        logger.info(f"✅ API call logging enabled (inside container: {container_log_dir})")
+        logger.info(
+            f"✅ API call logging enabled (inside container: {container_log_dir})"
+        )
         logger.info(f"   Logs will be copied to host at: {host_log_dir}")
     else:
         logger.info("ℹ️  API call logging disabled (use --log-completions to enable)")
-    
+
     logger.info("Using LLM config: %s", llm.model_dump_json(indent=2))
 
     # Create workspace (always builds with --platform linux/amd64)
@@ -568,7 +636,7 @@ def main() -> None:
         if args.log_completions:
             workspace.execute_command(f"mkdir -p {container_log_dir}")
             logger.info(f"Created log directory in container: {container_log_dir}")
-        
+
         # Initialize task environment
         init_task_environment(workspace, args.task_name, instructions_path)
 
@@ -580,9 +648,9 @@ def main() -> None:
                 with open(args.rubric_path, "r") as f:
                     rubric_content = f.read()
                 result = workspace.execute_command(
-                    f'''cat > /workspace/paper/rubric.json << "RUBRICEOF"
+                    f"""cat > /workspace/paper/rubric.json << "RUBRICEOF"
 {rubric_content}
-RUBRICEOF'''
+RUBRICEOF"""
                 )
                 if result.exit_code == 0:
                     rubric_path = "/workspace/paper/rubric.json"
@@ -591,19 +659,26 @@ RUBRICEOF'''
             else:
                 logger.warning(f"Rubric file not found: {args.rubric_path}")
 
+        # Determine critic settings
+        enable_critic = args.enable_critic and not args.disable_critic
+
         # Run multi-agent inference (async)
-        result = asyncio.run(run_multi_agent_inference(
-            workspace=workspace,
-            llm=llm,
-            task_name=args.task_name,
-            instructions_path="/workspace/instructions.md",
-            rubric_path=rubric_path,
-            max_iterations_per_agent=args.max_iterations_per_agent,
-        ))
+        result = asyncio.run(
+            run_multi_agent_inference(
+                workspace=workspace,
+                llm=llm,
+                task_name=args.task_name,
+                instructions_path="/workspace/instructions.md",
+                rubric_path=rubric_path,
+                max_iterations_per_agent=args.max_iterations_per_agent,
+                enable_critic=enable_critic,
+                max_refinements=args.max_refinements,
+            )
+        )
 
         # Extract submission
         extract_submission(workspace, args.submission_dir, args.task_name)
-        
+
         # Extract completion logs from container if logging was enabled
         if args.log_completions:
             extract_logs_from_container(workspace, host_log_dir, container_log_dir)
@@ -615,11 +690,13 @@ RUBRICEOF'''
             json.dump(result, f, indent=2)
 
         logger.info(f"Results saved to: {results_file}")
-        
+
         # Log completion log location if enabled
         if args.log_completions:
             logger.info(f"📝 API call logs saved to: {host_log_dir}")
-            logger.info(f"   Each API request/response is saved as a separate JSON file")
+            logger.info(
+                "   Each API request/response is saved as a separate JSON file"
+            )
 
     logger.info("Inference completed!")
 

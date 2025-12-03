@@ -5,19 +5,14 @@ This orchestrator coordinates specialized agents to reproduce research papers
 following the workflow defined in agent_rollout_plan.md.
 """
 
-import asyncio
 import json
 import os
 from enum import Enum
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from openhands.sdk import Agent, Conversation, Event, LLM, Message, get_logger
-from openhands.sdk.workspace import RemoteWorkspace
-from openhands.tools.preset.default import get_default_tools
-
 from benchmarks.paper_bench.agents import (
-    AgentState,
+    CriticAgent,
+    CritiqueRating,
     ExperimentConfigAgent,
     ExperimentExecutionAgent,
     InfrastructureAgent,
@@ -27,6 +22,10 @@ from benchmarks.paper_bench.agents import (
     ReportingAgent,
     ResultAnalysisAgent,
 )
+from openhands.sdk import LLM, Agent, get_logger
+from openhands.sdk.workspace import RemoteWorkspace
+from openhands.tools.preset.default import get_default_tools
+
 
 logger = get_logger(__name__)
 
@@ -67,6 +66,8 @@ class MultiAgentOrchestrator:
         paper_path: str = "/workspace/paper",
         submission_path: str = "/workspace/submission",
         shared_state_path: str = "/workspace/shared_state/shared_state.json",
+        enable_critic: bool = True,
+        max_refinements: int = 2,
     ):
         """
         Initialize the orchestrator.
@@ -78,6 +79,8 @@ class MultiAgentOrchestrator:
             paper_path: Path to paper files
             submission_path: Path for final submission
             shared_state_path: Path to shared state file for agent communication
+            enable_critic: Whether to enable critic agent for quality review
+            max_refinements: Maximum refinement iterations per agent
         """
         self.workspace = workspace
         self.llm = llm
@@ -85,6 +88,8 @@ class MultiAgentOrchestrator:
         self.paper_path = paper_path
         self.submission_path = submission_path
         self.shared_state_path = shared_state_path
+        self.enable_critic = enable_critic
+        self.max_refinements = max_refinements
 
         # Initialize shared state
         self.shared_state: Dict[str, Any] = {
@@ -94,6 +99,7 @@ class MultiAgentOrchestrator:
             "agents_completed": [],
             "agent_outputs": {},
             "errors": [],
+            "critiques": [],
         }
 
         # Initialize agents
@@ -141,20 +147,30 @@ class MultiAgentOrchestrator:
             ),
         }
 
+        # Initialize critic agent if enabled
+        self.critic_agent = None
+        if self.enable_critic:
+            self.critic_agent = CriticAgent(
+                workspace=workspace,
+                agent=Agent(llm=llm, tools=tools),
+                shared_state=self.shared_state,
+                max_refinements=max_refinements,
+            )
+
     def save_shared_state(self) -> None:
         """Save shared state to file."""
         try:
-            state_json = json.dumps(self.shared_state, indent=2)
             # Create directory first
             dir_path = os.path.dirname(self.shared_state_path)
             result = self.workspace.execute_command(f"mkdir -p {dir_path}")
             if result.exit_code != 0:
                 logger.warning(f"Failed to create directory: {result.stderr}")
                 return
-            
+
             # Write state to file using Python for proper JSON handling
             # Use a Python script to write JSON safely
             import json as json_module
+
             state_json_str = json_module.dumps(self.shared_state)
             # Create a Python script that writes the JSON
             python_script = f"""import json
@@ -164,13 +180,14 @@ with open('{self.shared_state_path}', 'w') as f:
 """
             # Write Python script to temp file and execute it
             result = self.workspace.execute_command(
-                f'''python3 << 'PYTHONSCRIPT'
+                f"""python3 << 'PYTHONSCRIPT'
 {python_script}
-PYTHONSCRIPT'''
+PYTHONSCRIPT"""
             )
             # Fallback: try using echo with base64 encoding if Python script fails
             if result.exit_code != 0:
                 import base64
+
                 state_b64 = base64.b64encode(state_json_str.encode()).decode()
                 result = self.workspace.execute_command(
                     f"echo '{state_b64}' | base64 -d > {self.shared_state_path}"
@@ -183,7 +200,9 @@ PYTHONSCRIPT'''
     def load_shared_state(self) -> None:
         """Load shared state from file."""
         try:
-            result = self.workspace.execute_command(f"cat {self.shared_state_path} 2>/dev/null || echo '{{}}'")
+            result = self.workspace.execute_command(
+                f"cat {self.shared_state_path} 2>/dev/null || echo '{{}}'"
+            )
             if result.exit_code == 0 and result.stdout:
                 try:
                     loaded_state = json.loads(result.stdout)
@@ -250,7 +269,7 @@ PYTHONSCRIPT'''
         max_callbacks_per_agent = 3
         max_total_callbacks = 10
         total_callbacks = 0
-        
+
         # Initialize callback counts
         for role in workflow:
             callback_count[role] = 0
@@ -259,9 +278,11 @@ PYTHONSCRIPT'''
         i = 0
         while i < len(workflow):
             agent_role = workflow[i]
-            
+
             try:
-                logger.info(f"Running agent: {agent_role.value} (run #{callback_count[agent_role] + 1})")
+                logger.info(
+                    f"Running agent: {agent_role.value} (run #{callback_count[agent_role] + 1})"
+                )
                 agent = self.agents[agent_role]
 
                 # Create context for agent
@@ -269,9 +290,12 @@ PYTHONSCRIPT'''
                     agent_role, instructions, rubric, workflow
                 )
 
-                # Run agent
-                result = await agent.run(
-                    context=context, max_iterations=max_iterations_per_agent
+                # Run agent with iterative refinement if critic is enabled
+                result = await self._run_agent_with_critic(
+                    agent=agent,
+                    agent_role=agent_role,
+                    context=context,
+                    max_iterations=max_iterations_per_agent,
                 )
 
                 # Update shared state
@@ -283,38 +307,50 @@ PYTHONSCRIPT'''
                 # Check if agent requests a callback to another agent
                 if result.get("callback_agent"):
                     callback_target = result.get("callback_agent")
-                    callback_reason = result.get("callback_reason", "No reason provided")
-                    
+                    callback_reason = result.get(
+                        "callback_reason", "No reason provided"
+                    )
+
                     # Find the target agent role
                     target_role = None
                     for role in workflow:
                         if role.value == callback_target:
                             target_role = role
                             break
-                    
+
                     if target_role and total_callbacks < max_total_callbacks:
                         if callback_count[target_role] < max_callbacks_per_agent:
-                            logger.info(f"🔄 Agent {agent_role.value} requests callback to {callback_target}")
+                            logger.info(
+                                f"🔄 Agent {agent_role.value} requests callback to {callback_target}"
+                            )
                             logger.info(f"   Reason: {callback_reason}")
-                            
+
                             # Insert the callback agent right after current position
                             workflow.insert(i + 1, target_role)
                             callback_count[target_role] += 1
                             total_callbacks += 1
-                            
+
                             # Log callback event
-                            self.shared_state["callback_events"] = self.shared_state.get("callback_events", [])
-                            self.shared_state["callback_events"].append({
-                                "from_agent": agent_role.value,
-                                "to_agent": callback_target,
-                                "reason": callback_reason,
-                                "callback_number": callback_count[target_role]
-                            })
+                            self.shared_state["callback_events"] = (
+                                self.shared_state.get("callback_events", [])
+                            )
+                            self.shared_state["callback_events"].append(
+                                {
+                                    "from_agent": agent_role.value,
+                                    "to_agent": callback_target,
+                                    "reason": callback_reason,
+                                    "callback_number": callback_count[target_role],
+                                }
+                            )
                             self.save_shared_state()
                         else:
-                            logger.warning(f"⚠️  Agent {callback_target} has reached max callbacks ({max_callbacks_per_agent}), ignoring request")
+                            logger.warning(
+                                f"⚠️  Agent {callback_target} has reached max callbacks ({max_callbacks_per_agent}), ignoring request"
+                            )
                     elif total_callbacks >= max_total_callbacks:
-                        logger.warning(f"⚠️  Max total callbacks ({max_total_callbacks}) reached, ignoring request")
+                        logger.warning(
+                            f"⚠️  Max total callbacks ({max_total_callbacks}) reached, ignoring request"
+                        )
                     elif not target_role:
                         logger.warning(f"⚠️  Unknown callback target: {callback_target}")
 
@@ -340,7 +376,135 @@ PYTHONSCRIPT'''
         await self._finalize_submission()
 
         logger.info("Multi-agent reproduction workflow completed")
+
+        # Add critic summary to shared state if critic was used
+        if self.critic_agent:
+            self.shared_state["critic_summary"] = (
+                self.critic_agent.get_critique_summary()
+            )
+
         return self.shared_state
+
+    async def _run_agent_with_critic(
+        self,
+        agent: Any,
+        agent_role: AgentRole,
+        context: Dict[str, Any],
+        max_iterations: int,
+    ) -> Dict[str, Any]:
+        """
+        Run agent with iterative refinement using critic.
+
+        Args:
+            agent: The agent to run
+            agent_role: Role of the agent
+            context: Context for the agent
+            max_iterations: Max iterations for agent run
+
+        Returns:
+            Final agent output after refinement
+        """
+        # Check if we should critique this agent
+        if not self.enable_critic or not self.critic_agent:
+            # No critic - just run agent normally
+            return await agent.run(context=context, max_iterations=max_iterations)
+
+        if not self.critic_agent.should_critique_agent(agent_role.value):
+            # Agent not enabled for critique - run normally
+            return await agent.run(context=context, max_iterations=max_iterations)
+
+        # Run agent with iterative refinement
+        best_result: Dict[str, Any] | None = None
+        best_score = 0.0
+        refinement_iteration = 0
+        result: Dict[str, Any] | None = None
+
+        while refinement_iteration < self.max_refinements:
+            refinement_iteration += 1
+
+            if refinement_iteration == 1:
+                logger.info(f"Running {agent_role.value} (initial attempt)")
+            else:
+                logger.info(
+                    f"Running {agent_role.value} (refinement #{refinement_iteration - 1})"
+                )
+
+            # Run the agent
+            result = await agent.run(context=context, max_iterations=max_iterations)
+            assert result is not None, "Agent run should always return a result"
+
+            # Critique the output
+            logger.info(f"Critic reviewing {agent_role.value} output...")
+            critique = self.critic_agent.critique_agent_output(
+                agent_name=agent_role.value,
+                agent_output=result,
+                context=context,
+            )
+
+            # Store critique in result
+            result["critique"] = critique.to_dict()
+            result["refinement_iteration"] = refinement_iteration
+
+            # Store critique in shared state
+            self.shared_state["critiques"].append(
+                {
+                    "agent": agent_role.value,
+                    "iteration": refinement_iteration,
+                    "rating": critique.rating.value,
+                    "score": critique.score,
+                }
+            )
+
+            # Update best result if this is better
+            if critique.score > best_score:
+                best_score = critique.score
+                best_result = result
+
+            # Check if we should stop refining
+            if critique.rating == CritiqueRating.PASS:
+                logger.info(
+                    f"{agent_role.value} passed critique (score: {critique.score:.2f})"
+                )
+                return result
+            elif critique.rating == CritiqueRating.FAIL:
+                logger.warning(
+                    f"{agent_role.value} failed critique (score: {critique.score:.2f})"
+                )
+                if refinement_iteration >= self.max_refinements:
+                    logger.warning(
+                        f"   Max refinements reached, using best attempt (score: {best_score:.2f})"
+                    )
+                    return best_result if best_result is not None else result
+                # Continue to refinement
+            else:  # NEEDS_IMPROVEMENT
+                logger.info(
+                    f"{agent_role.value} needs improvement (score: {critique.score:.2f})"
+                )
+                if refinement_iteration >= self.max_refinements:
+                    logger.info(
+                        f"   Max refinements reached, using best attempt (score: {best_score:.2f})"
+                    )
+                    return best_result if best_result is not None else result
+
+            # Prepare refinement context with feedback
+            context["refinement_feedback"] = {
+                "iteration": refinement_iteration,
+                "previous_attempt": result,
+                "critique": critique.to_dict(),
+                "specific_issues": critique.specific_issues,
+                "suggestions": critique.suggestions,
+            }
+
+            logger.info(
+                f"   Attempting refinement with {len(critique.specific_issues)} specific issues to address"
+            )
+
+        # Max refinements reached - return best result
+        logger.info(
+            f"   Max refinements reached, using best attempt (score: {best_score:.2f})"
+        )
+        assert result is not None, "Result should always be set after loop"
+        return best_result if best_result is not None else result
 
     def _build_agent_context(
         self,
@@ -356,9 +520,9 @@ PYTHONSCRIPT'''
             if prev_role == agent_role:
                 break
             if prev_role.value in self.shared_state["agent_outputs"]:
-                previous_outputs[prev_role.value] = self.shared_state[
-                    "agent_outputs"
-                ][prev_role.value]
+                previous_outputs[prev_role.value] = self.shared_state["agent_outputs"][
+                    prev_role.value
+                ]
 
         context = {
             "task_name": self.task_name,
@@ -372,7 +536,9 @@ PYTHONSCRIPT'''
 
         # Add role-specific context
         if agent_role == AgentRole.INFRASTRUCTURE:
-            context["task"] = "Set up Python environment, install dependencies, configure GPU access"
+            context["task"] = (
+                "Set up Python environment, install dependencies, configure GPU access"
+            )
         elif agent_role == AgentRole.MODEL_DATASET:
             context["task"] = "Load pre-trained models and set up datasets"
         elif agent_role == AgentRole.METHOD_IMPLEMENTATION:
@@ -413,15 +579,17 @@ echo "Reproduction completed!"
             # Create directory
             result = self.workspace.execute_command(f"mkdir -p {self.submission_path}")
             if result.exit_code != 0:
-                logger.warning(f"Failed to create submission directory: {result.stderr}")
+                logger.warning(
+                    f"Failed to create submission directory: {result.stderr}"
+                )
                 return
-            
+
             # Create reproduce.sh using heredoc
             result = self.workspace.execute_command(
-                f'''cat > {self.submission_path}/reproduce.sh << 'REPRODUCE_EOF'
+                f"""cat > {self.submission_path}/reproduce.sh << 'REPRODUCE_EOF'
 {reproduce_script}
 REPRODUCE_EOF
-chmod +x {self.submission_path}/reproduce.sh'''
+chmod +x {self.submission_path}/reproduce.sh"""
             )
             if result.exit_code != 0:
                 logger.warning(f"Failed to create reproduce.sh: {result.stderr}")
@@ -436,7 +604,7 @@ This repository contains the reproduction of the research paper.
 ## What was accomplished
 
 This reproduction was completed using a multi-agent system with the following agents:
-{', '.join(self.shared_state.get('agents_completed', []))}
+{", ".join(self.shared_state.get("agents_completed", []))}
 
 ## Running the reproduction
 
@@ -454,12 +622,11 @@ See shared_state.json for detailed outputs from each agent.
         try:
             # Create README.md using heredoc
             result = self.workspace.execute_command(
-                f'''cat > {self.submission_path}/README.md << 'README_EOF'
+                f"""cat > {self.submission_path}/README.md << 'README_EOF'
 {readme_content}
-README_EOF'''
+README_EOF"""
             )
             if result.exit_code != 0:
                 logger.warning(f"Failed to create README.md: {result.stderr}")
         except Exception as e:
             logger.warning(f"Failed to create README.md: {e}")
-
