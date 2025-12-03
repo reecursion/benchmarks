@@ -339,10 +339,10 @@ def extract_logs_from_container(
         
         logger.info(f"Found {file_count} completion log files in container")
 
-        # Create tar archive of logs
+        # Create tar archive of logs (use longer timeout for many files)
         archive_path = f"{TRANSFER_DIR}/completion_logs.tar.gz"
         archive_cmd = f"cd {container_log_dir} && tar -czf {archive_path} . 2>&1"
-        archive_result = workspace.execute_command(archive_cmd)
+        archive_result = workspace.execute_command(archive_cmd, timeout=300.0)
         if archive_result.exit_code != 0:
             logger.error(f"Failed to create logs archive: {archive_result.stderr}")
             return
@@ -388,23 +388,69 @@ def extract_submission(
     task_submission_dir = os.path.join(submission_dir, task_name)
     os.makedirs(task_submission_dir, exist_ok=True)
 
+    # Allowed file extensions for submission (source code, scripts, docs, configs only)
+    ALLOWED_EXTENSIONS = (
+        ".py", ".sh", ".md", ".txt", ".yaml", ".yml", ".json", 
+        ".cfg", ".toml", ".ini", ".rst", ".csv"
+    )
+    # Directories to exclude from submission
+    EXCLUDED_DIRS = (
+        "__pycache__", ".git", ".cache", "wandb", "mlruns", ".ipynb_checkpoints",
+        "node_modules", ".venv", "venv", "env", ".env", "conda", ".conda",
+        "checkpoints", "outputs", "results", "logs", "data", "datasets"
+    )
+    
     # Copy submission from workspace
     try:
         workspace.execute_command(f"mkdir -p {TRANSFER_DIR}")
-        # List files in submission directory
+        
+        # First, clean up the submission directory in the container
+        # Remove excluded directories
+        for excluded_dir in EXCLUDED_DIRS:
+            workspace.execute_command(
+                f"find /workspace/submission -type d -name '{excluded_dir}' -exec rm -rf {{}} + 2>/dev/null || true"
+            )
+        
+        # Remove non-allowed file types (model weights, datasets, etc.)
+        # Build find command to delete files NOT matching allowed extensions
+        allowed_pattern = " -o ".join([f'-name "*{ext}"' for ext in ALLOWED_EXTENSIONS])
+        cleanup_cmd = f'find /workspace/submission -type f ! \\( {allowed_pattern} \\) -delete 2>/dev/null || true'
+        workspace.execute_command(cleanup_cmd)
+        
+        # Also explicitly remove common large file types
+        large_file_extensions = [
+            "*.pt", "*.pth", "*.ckpt", "*.safetensors", "*.bin", "*.h5", "*.hdf5",
+            "*.pkl", "*.pickle", "*.npy", "*.npz", "*.parquet", "*.arrow",
+            "*.tar", "*.tar.gz", "*.tgz", "*.zip", "*.gz", "*.bz2",
+            "*.png", "*.jpg", "*.jpeg", "*.gif", "*.bmp", "*.tiff",
+            "*.mp3", "*.mp4", "*.wav", "*.avi", "*.mov",
+            "*.so", "*.o", "*.a", "*.dylib", "*.dll", "*.exe",
+            "*.pyc", "*.pyo"
+        ]
+        for ext in large_file_extensions:
+            workspace.execute_command(
+                f"find /workspace/submission -type f -name '{ext}' -delete 2>/dev/null || true"
+            )
+        
+        # Remove empty directories
+        workspace.execute_command(
+            "find /workspace/submission -type d -empty -delete 2>/dev/null || true"
+        )
+        
+        # List files in submission directory after cleanup
         result = workspace.execute_command("find /workspace/submission -type f 2>/dev/null || true")
         if result.exit_code == 0:
             files = [f for f in result.stdout.strip().split("\n") if f]
-            logger.info(f"Found {len(files)} files in submission directory")
+            logger.info(f"Found {len(files)} files in submission directory after cleanup")
             
             if not files:
-                logger.warning("No files found in submission directory")
+                logger.warning("No files found in submission directory after cleanup")
                 return
 
-            # Create tar archive in the container
+            # Create tar archive in the container (should be fast now with only source files)
             archive_path = f"{TRANSFER_DIR}/submission.tar.gz"
             archive_command = f"cd /workspace/submission && tar -czf {archive_path} . 2>&1"
-            archive_result = workspace.execute_command(archive_command)
+            archive_result = workspace.execute_command(archive_command, timeout=300.0)
             if archive_result.exit_code != 0:
                 logger.error(f"Failed to create submission archive: {archive_result.stderr}")
                 return

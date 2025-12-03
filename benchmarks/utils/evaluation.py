@@ -2,21 +2,19 @@
 Evaluation orchestrator.
 """
 
-import base64
 import json
 import os
 import sys
 from abc import ABC, abstractmethod
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 from tqdm import tqdm
 
 from benchmarks.utils.constants import OUTPUT_FILENAME
-from benchmarks.utils.critics import get_completed_instances
+from benchmarks.utils.critics import CriticRegistry, get_completed_instances
 from benchmarks.utils.iterative import aggregate_results, get_failed_instances
 from benchmarks.utils.models import (
     EvalInstance,
@@ -25,7 +23,6 @@ from benchmarks.utils.models import (
     EvalOutput,
 )
 from openhands.sdk import get_logger
-from openhands.sdk.critic import CriticBase
 from openhands.sdk.workspace import RemoteWorkspace
 
 
@@ -97,63 +94,9 @@ class Evaluation(ABC, BaseModel):
             error=(
                 f"Instance failed after {retry_count} retries. Last error: {str(error)}"
             )[:200],
-            history=[],
+            history=None,
             instance=instance.data,
         )
-
-    def _capture_conversation_archive(
-        self,
-        workspace: RemoteWorkspace,
-        instance: EvalInstance,
-    ) -> None:
-        """Capture conversation trajectory from the remote runtime.
-
-        Persists the /workspace/conversations directory from the remote runtime
-        to a per-instance tar.gz file in the evaluation output directory.
-
-        This provides a complete record of the agent's conversation history,
-        which is valuable for debugging, analysis, and reproducibility.
-
-        Args:
-            workspace: The remote workspace to capture from
-            instance: The evaluation instance being processed
-        """
-        try:
-            # Create command to tar and base64 encode the conversations directory
-            conv_cmd = (
-                "cd / && "
-                "if [ -d workspace/conversations ]; then "
-                "tar -czf - workspace/conversations | base64; "
-                "else echo ''; fi"
-            )
-            tar_cmd = workspace.execute_command(conv_cmd)
-
-            if tar_cmd.exit_code == 0 and tar_cmd.stdout.strip():
-                # Save to instance-specific file to support parallel execution
-                conversations_dir = (
-                    Path(self.metadata.eval_output_dir) / "conversations"
-                )
-                conversations_dir.mkdir(parents=True, exist_ok=True)
-                conv_tar_path = conversations_dir / f"{instance.id}.tar.gz"
-
-                # Decode and write the tar.gz file
-                conv_tar_path.write_bytes(base64.b64decode(tar_cmd.stdout))
-                logger.info(
-                    "[child] Saved conversation archive for %s to %s",
-                    instance.id,
-                    conv_tar_path,
-                )
-            else:
-                logger.debug(
-                    "[child] No conversation archive for %s (directory not found or empty)",
-                    instance.id,
-                )
-        except Exception as e:
-            logger.warning(
-                "[child] Failed to capture conversation trajectory for %s: %s",
-                instance.id,
-                e,
-            )
 
     # --- Runner ---
     def run(
@@ -175,54 +118,48 @@ class Evaluation(ABC, BaseModel):
         # Use iterative mode for all cases
         return self._run_iterative_mode(on_result=on_result)
 
-    def _get_instances_for_attempt(
-        self,
-        attempt: int,
-        all_instances: List[EvalInstance],
-        critic: CriticBase,
-    ) -> List[EvalInstance]:
+    def _get_resume_start_attempt(self) -> Tuple[int, List[EvalOutput]]:
         """
-        Determine which instances need processing for a specific attempt.
-
-        This method handles all resume scenarios naturally without special cases:
-        - New instances: Not completed in attempt 1 yet → include them
-        - Resume: Already completed in this attempt → exclude them
-        - Expansion: Just more instances not in attempt 1 yet → include them
-
-        Args:
-            attempt: The attempt number (1-indexed)
-            all_instances: All instances in the dataset
-            critic: The critic to use for determining failures
+        Find where to resume and load previous outputs.
 
         Returns:
-            List of instances that need processing for this attempt
+            Tuple of (start_attempt, previous_outputs)
+            - start_attempt: Which attempt to start from (1 for fresh start)
+            - previous_outputs: All outputs from previous attempts
         """
-        attempt_file = os.path.join(
-            self.metadata.eval_output_dir,
-            f"output.critic_attempt_{attempt}.jsonl",
-        )
-        completed_in_attempt = get_completed_instances(attempt_file)
+        all_previous_outputs = []
 
-        if attempt == 1:
-            # Attempt 1: Process everything not yet completed in attempt 1
-            return [
-                inst for inst in all_instances if inst.id not in completed_in_attempt
-            ]
-        else:
-            # Attempt N: Process what failed in N-1 and isn't completed in N
-            prev_file = os.path.join(
-                self.metadata.eval_output_dir,
-                f"output.critic_attempt_{attempt - 1}.jsonl",
+        # Check backwards from max_attempts to find the last attempt with results
+        for attempt in range(self.metadata.max_attempts, 0, -1):
+            attempt_file = os.path.join(
+                self.metadata.eval_output_dir, f"output.critic_attempt_{attempt}.jsonl"
             )
-            if not os.path.exists(prev_file):
-                return []
+            if os.path.exists(attempt_file) and os.path.getsize(attempt_file) > 0:
+                # Found the last attempt with results, resume from here
+                logger.info(f"Found existing results up to attempt {attempt}")
 
-            failed_in_prev = get_failed_instances(prev_file, critic)
-            return [
-                inst
-                for inst in all_instances
-                if inst.id in failed_in_prev and inst.id not in completed_in_attempt
-            ]
+                # Load ALL previous outputs from attempts 1 to attempt
+                for a in range(1, attempt + 1):
+                    a_file = os.path.join(
+                        self.metadata.eval_output_dir,
+                        f"output.critic_attempt_{a}.jsonl",
+                    )
+                    if os.path.exists(a_file):
+                        try:
+                            with open(a_file, "r", encoding="utf-8") as f:
+                                for line in f:
+                                    if line.strip():
+                                        output = EvalOutput(**json.loads(line))
+                                        all_previous_outputs.append(output)
+                        except Exception as e:
+                            logger.warning(f"Error loading outputs from {a_file}: {e}")
+
+                logger.info(f"Loaded {len(all_previous_outputs)} previous outputs")
+                return attempt, all_previous_outputs
+
+        # No existing files found, start fresh
+        logger.info("No existing results found, starting fresh")
+        return 1, []
 
     def _run_iterative_mode(
         self,
@@ -230,6 +167,7 @@ class Evaluation(ABC, BaseModel):
         on_result: Optional[OnResult] = None,
     ) -> List[EvalOutput]:
         """Run evaluation with support for single or multiple attempts."""
+        # Get all instances first
         all_instances = self.prepare_instances()
 
         total_instances = len(all_instances)
@@ -239,15 +177,50 @@ class Evaluation(ABC, BaseModel):
             logger.warning("No instances to process.")
             return []
 
-        critic = self.metadata.critic
-        all_outputs: List[EvalOutput] = []
+        # Check for resume point and load previous outputs
+        start_attempt, all_outputs = self._get_resume_start_attempt()
 
-        for attempt in range(1, self.metadata.max_attempts + 1):
+        # For single attempts without a critic, use the pass critic
+        critic_name = self.metadata.critic_name
+        if not critic_name:
+            if self.metadata.max_attempts == 1:
+                critic_name = "pass"
+                logger.info(
+                    "No critic specified for single attempt, using 'pass' critic"
+                )
+            else:
+                raise ValueError("critic_name is required for multi-attempt evaluation")
+
+        critic = CriticRegistry.create_critic(critic_name)
+
+        for attempt in range(start_attempt, self.metadata.max_attempts + 1):
             logger.info(f"Starting attempt {attempt}/{self.metadata.max_attempts}")
 
-            instances_to_process = self._get_instances_for_attempt(
-                attempt, all_instances, critic
+            # Determine what this attempt should process
+            if attempt == 1:
+                target_instances = set(inst.id for inst in all_instances)
+            else:
+                prev_file = os.path.join(
+                    self.metadata.eval_output_dir,
+                    f"output.critic_attempt_{attempt - 1}.jsonl",
+                )
+                if os.path.exists(prev_file):
+                    target_instances = get_failed_instances(prev_file, critic)
+                else:
+                    target_instances = set()
+
+            # Exclude already completed in current attempt
+            completed = get_completed_instances(
+                os.path.join(
+                    self.metadata.eval_output_dir,
+                    f"output.critic_attempt_{attempt}.jsonl",
+                )
             )
+            instances_to_process = [
+                inst
+                for inst in all_instances
+                if inst.id in target_instances and inst.id not in completed
+            ]
 
             logger.info(f"Processing {len(instances_to_process)} instances")
 
@@ -337,7 +310,7 @@ class Evaluation(ABC, BaseModel):
         aggregate_results(
             output_dir=self.metadata.eval_output_dir,
             max_attempts=self.metadata.max_attempts,
-            critic=self.metadata.critic,
+            critic_name=critic_name,
             final_output_file="output.jsonl",
         )
 
@@ -406,10 +379,6 @@ class Evaluation(ABC, BaseModel):
                 try:
                     workspace = self.prepare_workspace(instance)
                     out = self.evaluate_instance(instance, workspace)
-
-                    # Capture conversation archive after successful evaluation
-                    self._capture_conversation_archive(workspace, instance)
-
                     logger.info("[child] done id=%s", instance.id)
                     return instance, out
                 except Exception as e:
@@ -475,7 +444,6 @@ def reset_logger_for_multiprocessing(log_dir: str, instance_id: str) -> None:
 
     # Set up logger
     log_file = os.path.join(log_dir, f"instance_{instance_id}.log")
-    output_log_file = os.path.join(log_dir, f"instance_{instance_id}.output.log")
 
     # Get root logger and remove all existing handlers
     root_logger = logging.getLogger()
@@ -495,13 +463,8 @@ def reset_logger_for_multiprocessing(log_dir: str, instance_id: str) -> None:
 
     # Print one INFO line with helpful hint
     root_logger.info(
-        f"""
-    === Evaluation Started (instance {instance_id}) ===
-    View live output:
-    • tail -f {log_file}          (logger)
-    • tail -f {output_log_file}   (stdout/stderr)
-    ===============================================
-    """.strip()
+        f"Starting evaluation for instance {instance_id}.\n"
+        f'Hint: run "tail -f {log_file}" to see live logs in a separate shell'
     )
 
     # Now set console to WARNING+ only

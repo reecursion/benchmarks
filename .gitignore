@@ -1,6 +1,9 @@
 # macOS artifacts
 .DS_Store
 
+# Vendor directory - ignore all contents
+vendor/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

@@ -1,150 +1,216 @@
 """
 Critic system for evaluation.
 
-This files provides utility functions
-for working with EvalOutput in benchmarks and CriticBase implementations.
+This module contains the base Critic class and registry system for managing
+different critics that evaluate whether an instance was successfully completed.
 """
 
 import json
 import os
-from argparse import ArgumentParser, Namespace
-from pathlib import Path
-from typing import Set
+from abc import ABC, abstractmethod
+from typing import Dict, Set, Type
 
+from pydantic import BaseModel
+
+from benchmarks.utils.critics_utils import _has_non_empty_git_patch
 from benchmarks.utils.models import EvalInstanceID, EvalOutput
 from openhands.sdk import get_logger
-from openhands.sdk.critic import (
-    AgentFinishedCritic,
-    CriticBase,
-    EmptyPatchCritic,
-    PassCritic,
-)
-from openhands.sdk.event import LLMConvertibleEvent
 
 
 logger = get_logger(__name__)
 
 
-CRITIC_NAME_TO_CLASS = {
-    "pass": PassCritic,
-    "finish_with_patch": AgentFinishedCritic,
-    "empty_patch_critic": EmptyPatchCritic,
-}
-
-
-def add_critic_args(parser: ArgumentParser) -> None:
-    """Add critic-related arguments to argparse parser."""
-    parser.add_argument(
-        "--critic",
-        type=str,
-        default="pass",
-        help=(
-            "Name of the critic to use for evaluation (default: 'pass'). "
-            "Critics determine whether an agent's output is considered successful "
-            "and whether another attempt should be made in iterative evaluation mode. "
-            "Available critics: "
-            "'pass' - Always accepts the output (no retry logic, suitable for single-attempt runs), "
-            "'finish_with_patch' - Requires both AgentFinishAction and non-empty git patch, "
-            "'empty_patch_critic' - Only requires non-empty git patch. "
-            "For single-attempt runs (default), 'pass' is recommended as the actual evaluation "
-            "is performed by the benchmark's own scoring system."
-        ),
-    )
-    parser.add_argument(
-        "--critic-config",
-        type=str,
-        default=None,
-        help="Path to JSON config file with critic parameters (e.g., {'api_key': 'xyz', 'timeout': 120})",
-    )
-
-
-def create_critic(args: Namespace) -> CriticBase:
+class Critic(ABC, BaseModel):
     """
-    Create a critic from parsed argparse arguments.
+    Base class for all critics.
 
-    Args:
-        args: Parsed arguments from argparse
-
-    Returns:
-        Critic instance
-
-    Example:
-        # Simple critic
-        parser = get_parser()
-        args = parser.parse_args(['--critic', 'pass'])
-        critic = create_critic(args)
-
-        # Critic with config file
-        args = parser.parse_args(['--critic', 'client', '--critic-config', 'critic.json'])
-        critic = create_critic(args)
+    Critics evaluate whether an agent properly completed a task based on
+    the evaluation output.
     """
-    critic_name = args.critic
 
-    # Load config if provided
-    kwargs = {}
-    if args.critic_config:
-        config_path = Path(args.critic_config)
-        if not config_path.exists():
-            raise ValueError(f"Critic config file not found: {args.critic_config}")
+    @abstractmethod
+    def evaluate_instance(self, output: EvalOutput) -> bool:
+        """
+        Evaluate if an instance was successfully completed.
 
-        with open(config_path) as f:
-            kwargs = json.load(f)
+        Args:
+            output: The evaluation output to check
 
-        logger.info(
-            f"Loaded critic config from {args.critic_config}: {list(kwargs.keys())}"
-        )
-
-    # Create critic (Pydantic will validate the kwargs)
-    if critic_name in CRITIC_NAME_TO_CLASS:
-        critic_class = CRITIC_NAME_TO_CLASS[critic_name]
-        critic = critic_class(**kwargs)
-        logger.info(f"Created critic: {critic_name} with args: {kwargs}")
-        return critic
-    else:
-        raise ValueError(
-            f"Unknown critic: {critic_name}. "
-            f"Available: pass, finish_with_patch, empty_patch_critic"
-        )
+        Returns:
+            True if the instance was successfully completed, False otherwise
+        """
+        pass
 
 
-def extract_git_patch(eval_output: EvalOutput) -> str | None:
+class AgentFinishedCritic(Critic):
     """
-    Extract git patch from EvalOutput.
+    Default critic that evaluates whether an agent properly finished a task.
 
-    Args:
-        eval_output: The evaluation output
-
-    Returns:
-        Git patch string or None if not present
+    This critic checks two main criteria:
+    1. The agent's last action was an AgentFinishAction (proper completion)
+    2. The generated git patch is non-empty (actual changes were made)
     """
-    if not eval_output.test_result:
-        return None
-    return eval_output.test_result.get("git_patch")
+
+    def evaluate_instance(self, output: EvalOutput) -> bool:
+        """
+        Evaluate if an instance was successfully completed.
+
+        Args:
+            output: The evaluation output to check
+
+        Returns:
+            True if the instance was successfully completed, False otherwise
+        """
+        try:
+            # Check if git patch is non-empty
+            if not _has_non_empty_git_patch(output):
+                logger.debug(f"Instance {output.instance_id}: Empty git patch")
+                return False
+
+            # Check if agent properly finished with AgentFinishAction
+            if not self._has_agent_finish_action(output):
+                logger.debug(f"Instance {output.instance_id}: No AgentFinishAction")
+                return False
+
+            logger.debug(f"Instance {output.instance_id}: Successfully completed")
+            return True
+
+        except Exception as e:
+            logger.warning(f"Error evaluating instance {output.instance_id}: {e}")
+            return False
+
+    def _has_agent_finish_action(self, output: EvalOutput) -> bool:
+        """Check if the last action was a FinishAction."""
+        if not output.history:
+            return False
+
+        # Look for the last action in the history
+        for event in reversed(output.history):
+            if isinstance(event, dict) and event.get("kind") == "ActionEvent":
+                action_kind = event.get("action", {}).get("kind", "")
+                if action_kind == "FinishAction":
+                    return True
+                # If we find any other action type, the agent didn't finish properly
+                elif action_kind:
+                    return False
+
+        return False
 
 
-def evaluate_output(critic: CriticBase, eval_output: EvalOutput) -> bool:
+class EmptyPatchCritic(Critic):
     """
-    Evaluate an EvalOutput using a critic.
+    Critic that only evaluates whether a git patch is non-empty.
 
-    This is a convenience function that extracts history and git_patch
-    from EvalOutput and calls the critic's evaluate method.
+    This critic checks only one criterion:
+    - The generated git patch is non-empty (actual changes were made)
 
-    Args:
-        critic: The SDK critic to use
-        eval_output: The evaluation output to check
-
-    Returns:
-        True if the instance was successfully completed, False otherwise
+    Unlike AgentFinishedCritic, this critic does not check for proper
+    agent completion with FinishAction.
     """
-    events = eval_output.history
-    llm_events: list[LLMConvertibleEvent] = [
-        e for e in events if isinstance(e, LLMConvertibleEvent)
-    ]
 
-    git_patch = extract_git_patch(eval_output)
-    result = critic.evaluate(llm_events, git_patch)
+    def evaluate_instance(self, output: EvalOutput) -> bool:
+        """
+        Evaluate if an instance has a non-empty git patch.
 
-    return result.success
+        Args:
+            output: The evaluation output to check
+
+        Returns:
+            True if the git patch is non-empty, False otherwise
+        """
+        try:
+            # Check if git patch is non-empty
+            if not _has_non_empty_git_patch(output):
+                logger.debug(f"Instance {output.instance_id}: Empty git patch")
+                return False
+
+            logger.debug(f"Instance {output.instance_id}: Non-empty git patch found")
+            return True
+
+        except Exception as e:
+            logger.warning(f"Error evaluating instance {output.instance_id}: {e}")
+            return False
+
+
+class PassCritic(Critic):
+    """
+    Critic that always returns True.
+
+    This critic can be used when no evaluation is needed or when
+    all instances should be considered successful regardless of their output.
+    """
+
+    def evaluate_instance(self, output: EvalOutput) -> bool:
+        """
+        Always evaluate an instance as successful.
+
+        Args:
+            output: The evaluation output to check (ignored)
+
+        Returns:
+            Always True
+        """
+        logger.debug(f"Instance {output.instance_id}: PassCritic always returns True")
+        return True
+
+
+class CriticRegistry:
+    """
+    Registry for managing available critics.
+
+    This class provides a factory pattern for creating critics by name,
+    making it easy to add new critics without modifying existing code.
+    """
+
+    _critics: Dict[str, Type[Critic]] = {}
+
+    @classmethod
+    def register(cls, name: str, critic_class: Type[Critic]) -> None:
+        """
+        Register a critic class with a given name.
+
+        Args:
+            name: The name to register the critic under
+            critic_class: The critic class to register
+        """
+        cls._critics[name] = critic_class
+
+    @classmethod
+    def create_critic(cls, name: str) -> Critic:
+        """
+        Create a critic instance by name.
+
+        Args:
+            name: The name of the critic to create
+
+        Returns:
+            An instance of the requested critic
+
+        Raises:
+            ValueError: If the critic name is not registered
+        """
+        if name not in cls._critics:
+            available = list(cls._critics.keys())
+            raise ValueError(f"Unknown critic: {name}. Available critics: {available}")
+
+        critic_class = cls._critics[name]
+        return critic_class()
+
+    @classmethod
+    def list_critics(cls) -> list[str]:
+        """
+        Get a list of all registered critic names.
+
+        Returns:
+            List of registered critic names
+        """
+        return list(cls._critics.keys())
+
+
+# Register default critics
+CriticRegistry.register("finish_with_patch", AgentFinishedCritic)
+CriticRegistry.register("empty_patch_critic", EmptyPatchCritic)
+CriticRegistry.register("pass", PassCritic)
 
 
 def get_completed_instances(output_file: str) -> Set[EvalInstanceID]:
@@ -168,7 +234,7 @@ def get_completed_instances(output_file: str) -> Set[EvalInstanceID]:
             for line_num, line in enumerate(f, 1):
                 try:
                     data = json.loads(line.strip())
-                    output = EvalOutput.model_validate(data)
+                    output = EvalOutput(**data)
                     completed_instances.add(output.instance_id)
 
                 except json.JSONDecodeError as e:
@@ -186,17 +252,18 @@ def get_completed_instances(output_file: str) -> Set[EvalInstanceID]:
     return completed_instances
 
 
-def get_failed_instances(output_file: str, critic: CriticBase) -> Set[EvalInstanceID]:
+def get_failed_instances(output_file: str, critic: Critic) -> Set[EvalInstanceID]:
     """
     Get the set of failed instance IDs from an output file.
 
     Args:
         output_file: Path to the JSONL output file
-        critic: SDK critic to use for evaluation
+        critic: Critic to use for evaluation.
 
     Returns:
         Set of instance IDs that failed
     """
+
     failed_instances: Set[EvalInstanceID] = set()
 
     if not os.path.exists(output_file):
@@ -208,10 +275,9 @@ def get_failed_instances(output_file: str, critic: CriticBase) -> Set[EvalInstan
             for line_num, line in enumerate(f, 1):
                 try:
                     data = json.loads(line.strip())
-                    output = EvalOutput.model_validate(data)
+                    output = EvalOutput(**data)
 
-                    # Evaluate using the critic
-                    if not evaluate_output(critic, output):
+                    if not critic.evaluate_instance(output):
                         failed_instances.add(output.instance_id)
 
                 except json.JSONDecodeError as e:

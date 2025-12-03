@@ -6,14 +6,18 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 
 def _get_submodule_sha(submodule_path: Path) -> str:
-    result = subprocess.run(
-        ["git", "submodule", "status", str(submodule_path)],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    sha = result.stdout.strip().split()[0].lstrip("+-")
-    return sha
+    try:
+        result = subprocess.run(
+            ["git", "submodule", "status", str(submodule_path)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        sha = result.stdout.strip().split()[0].lstrip("+-")
+        return sha
+    except subprocess.CalledProcessError:
+        # Fallback if submodule is not properly initialized
+        return "unknown"
 
 
 def get_sdk_sha() -> str:
