@@ -12,6 +12,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
+from typing import Optional
 
 import httpx
 from urllib.parse import quote
@@ -70,8 +71,33 @@ def get_config_for_task(
     )
 
 
+def _copy_instructions(workspace: RemoteWorkspace, instructions_path: str) -> None:
+    """Copy instructions file to workspace."""
+    if os.path.exists(instructions_path):
+        with open(instructions_path, "r") as f:
+            instructions_content = f.read()
+
+        instructions_file = "/workspace/instructions.md"
+        result = workspace.execute_command(f"mkdir -p $(dirname {instructions_file})")
+        if result.exit_code == 0:
+            result = workspace.execute_command(
+                f'''cat > {instructions_file} << 'INSTRUCTIONSEOF'
+{instructions_content}
+INSTRUCTIONSEOF'''
+            )
+            if result.exit_code == 0:
+                logger.info(f"Copied instructions to {instructions_file}")
+            else:
+                logger.warning(f"Failed to write instructions: {result.stderr}")
+        else:
+            logger.warning(f"Failed to create instructions directory: {result.stderr}")
+    else:
+        logger.warning(f"Instructions file not found: {instructions_path}")
+
+
 def init_task_environment(
-    workspace: RemoteWorkspace, task_name: str, instructions_path: str
+    workspace: RemoteWorkspace, task_name: str, instructions_path: str,
+    paper_cache_dir: Optional[str] = None
 ) -> None:
     """
     Initialize the task environment by setting up paper files and instructions.
@@ -80,6 +106,7 @@ def init_task_environment(
         workspace: The workspace to initialize
         task_name: Name of the task/paper
         instructions_path: Path to instructions file on host
+        paper_cache_dir: Optional path to pre-downloaded paper files (avoids Git LFS issues)
     """
     logger.info(f"Initializing task environment for: {task_name}")
 
@@ -89,6 +116,102 @@ def init_task_environment(
     # Clear paper directory if it exists (safer than rm -rf)
     workspace.execute_command("rm -rf /workspace/paper/* /workspace/paper/.* 2>/dev/null || true")
     workspace.execute_command("mkdir -p /workspace/paper")
+
+    # Check for local paper cache first (bypasses Git LFS issues)
+    local_paper_path = None
+    if paper_cache_dir:
+        candidate = os.path.join(paper_cache_dir, task_name)
+        if os.path.exists(candidate) and os.path.isdir(candidate):
+            local_paper_path = candidate
+            logger.info(f"📁 Found local paper cache at: {local_paper_path}")
+    
+    # Also check default cache location
+    if not local_paper_path:
+        default_cache = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "paper_cache", task_name)
+        if os.path.exists(default_cache) and os.path.isdir(default_cache):
+            local_paper_path = default_cache
+            logger.info(f"📁 Found paper in default cache: {local_paper_path}")
+
+    if local_paper_path:
+        # Use local cache - copy files to workspace using file_upload API
+        logger.info(f"Using pre-downloaded paper files from: {local_paper_path}")
+        
+        def upload_file_to_workspace(src_path: str, dest_path: str) -> bool:
+            """Upload a file to workspace using the file_upload API."""
+            try:
+                result = workspace.file_upload(src_path, dest_path)
+                return result.success
+            except Exception as e:
+                logger.warning(f"file_upload failed for {src_path}, falling back to base64: {e}")
+                # Fallback to base64 method
+                try:
+                    import base64
+                    with open(src_path, 'rb') as f:
+                        content = f.read()
+                    b64_content = base64.b64encode(content).decode('ascii')
+                    
+                    # Split large base64 content into chunks
+                    chunk_size = 50000
+                    if len(b64_content) <= chunk_size:
+                        cmd_result = workspace.execute_command(
+                            f"echo '{b64_content}' | base64 -d > {dest_path}"
+                        )
+                    else:
+                        workspace.execute_command(f"rm -f {dest_path}.b64 {dest_path}")
+                        for i in range(0, len(b64_content), chunk_size):
+                            chunk = b64_content[i:i+chunk_size]
+                            workspace.execute_command(f"echo -n '{chunk}' >> {dest_path}.b64")
+                        cmd_result = workspace.execute_command(
+                            f"base64 -d {dest_path}.b64 > {dest_path} && rm -f {dest_path}.b64"
+                        )
+                    return cmd_result.exit_code == 0
+                except Exception as e2:
+                    logger.warning(f"Fallback also failed for {src_path}: {e2}")
+                    return False
+        
+        # Copy each file from local cache to workspace
+        for filename in os.listdir(local_paper_path):
+            src_path = os.path.join(local_paper_path, filename)
+            if os.path.isfile(src_path):
+                dest_path = f"/workspace/paper/{filename}"
+                if upload_file_to_workspace(src_path, dest_path):
+                    logger.info(f"  Copied: {filename}")
+                else:
+                    logger.warning(f"  Failed to copy: {filename}")
+            elif os.path.isdir(src_path):
+                # Handle subdirectories (like assets/)
+                workspace.execute_command(f"mkdir -p /workspace/paper/{filename}")
+                for subfile in os.listdir(src_path):
+                    sub_src = os.path.join(src_path, subfile)
+                    if os.path.isfile(sub_src):
+                        dest_path = f"/workspace/paper/{filename}/{subfile}"
+                        if upload_file_to_workspace(sub_src, dest_path):
+                            logger.debug(f"  Copied: {filename}/{subfile}")
+                        else:
+                            logger.warning(f"  Failed to copy: {filename}/{subfile}")
+                logger.info(f"  Copied: {filename}/ ({len(os.listdir(src_path))} files)")
+        
+        # Verify files were copied
+        verify_result = workspace.execute_command("ls -la /workspace/paper/")
+        logger.info(f"Paper files in workspace:\n{verify_result.stdout}")
+        
+        # Check paper.md exists and has actual content
+        check_result = workspace.execute_command("wc -c /workspace/paper/paper.md 2>&1")
+        if "No such file" in check_result.stdout or check_result.exit_code != 0:
+            logger.error(f"❌ paper.md was not copied successfully! Falling back to Git LFS...")
+            # Don't return - fall through to Git LFS download
+        else:
+            head_result = workspace.execute_command("head -5 /workspace/paper/paper.md 2>&1")
+            if "git-lfs" in head_result.stdout:
+                logger.error("❌ Local cache contains LFS pointers! Please re-download with git lfs pull")
+            else:
+                logger.info(f"✅ Paper files loaded from local cache successfully ({check_result.stdout.strip()})")
+                # Copy instructions and return early
+                _copy_instructions(workspace, instructions_path)
+                return
+
+    # Fall back to Git LFS download (original method)
+    logger.info("No local paper cache found, falling back to Git LFS download...")
 
     # Install git-lfs if not already installed (needed for cloning paper files)
     logger.info("Installing git-lfs...")
@@ -259,29 +382,7 @@ cp -rf project/paperbench/data/papers/{task_name}/* /workspace/paper/ 2>&1
                 logger.info(f"  {line}")
 
     # Copy instructions
-    if os.path.exists(instructions_path):
-        # Read instructions file
-        with open(instructions_path, "r") as f:
-            instructions_content = f.read()
-
-        # Write to workspace
-        instructions_file = "/workspace/instructions.md"
-        result = workspace.execute_command(f"mkdir -p $(dirname {instructions_file})")
-        if result.exit_code == 0:
-            # Write instructions using heredoc
-            result = workspace.execute_command(
-                f'''cat > {instructions_file} << 'INSTRUCTIONSEOF'
-{instructions_content}
-INSTRUCTIONSEOF'''
-            )
-            if result.exit_code == 0:
-                logger.info(f"Copied instructions to {instructions_file}")
-            else:
-                logger.warning(f"Failed to write instructions: {result.stderr}")
-        else:
-            logger.warning(f"Failed to create instructions directory: {result.stderr}")
-    else:
-        logger.warning(f"Instructions file not found: {instructions_path}")
+    _copy_instructions(workspace, instructions_path)
 
     logger.info("Task environment initialized successfully")
 
@@ -598,6 +699,13 @@ def main() -> None:
         action="store_true",
         help="Enable GPU support (requires nvidia-docker)",
     )
+    parser.add_argument(
+        "--paper-cache-dir",
+        type=str,
+        default=None,
+        help="Directory containing pre-downloaded paper files (avoids Git LFS issues). "
+             "Structure should be: <cache_dir>/<task_name>/paper.md, rubric.json, etc.",
+    )
 
     args = parser.parse_args()
 
@@ -689,7 +797,10 @@ def main() -> None:
                     logger.info(f"Created log directory in container: {container_log_dir}")
         
                 # Initialize task environment
-                init_task_environment(workspace, task_name, instructions_path)
+                init_task_environment(
+                    workspace, task_name, instructions_path,
+                    paper_cache_dir=args.paper_cache_dir
+                )
 
                 # Resolve rubric path if provided
                 rubric_path = None
