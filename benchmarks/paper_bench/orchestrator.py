@@ -86,7 +86,7 @@ class MultiAgentOrchestrator:
         self.submission_path = submission_path
         self.shared_state_path = shared_state_path
 
-        # Initialize shared state
+        # Initialize shared state with enhanced memory structure
         self.shared_state: Dict[str, Any] = {
             "task_name": task_name,
             "paper_path": paper_path,
@@ -94,6 +94,20 @@ class MultiAgentOrchestrator:
             "agents_completed": [],
             "agent_outputs": {},
             "errors": [],
+            # Enhanced shared memory for cross-agent context
+            "paper_context": {
+                "title": "",
+                "summary": "",
+                "dependencies": [],  # List of required packages
+                "models": [],  # Models mentioned in paper
+                "datasets": [],  # Datasets mentioned in paper
+                "methods": [],  # Key methods to implement
+                "experiments": [],  # Experiments to reproduce
+                "metrics": [],  # Metrics to calculate
+                "key_results": [],  # Key results from paper tables/figures
+            },
+            "files_created": {},  # Dict mapping agent_name -> list of files created
+            "reproduce_steps": [],  # Ordered list of commands for reproduce.sh
         }
 
         # Initialize agents
@@ -193,6 +207,75 @@ PYTHONSCRIPT'''
         except Exception as e:
             logger.warning(f"Failed to load shared state: {e}")
 
+    def format_shared_context(self) -> str:
+        """Format the shared context as a string for agent prompts."""
+        lines = []
+        
+        paper_context = self.shared_state.get("paper_context", {})
+        files_created = self.shared_state.get("files_created", {})
+        reproduce_steps = self.shared_state.get("reproduce_steps", [])
+        
+        # Paper context section
+        if paper_context.get("summary"):
+            lines.append("## Paper Summary (from previous agents)")
+            lines.append(paper_context["summary"])
+            lines.append("")
+        
+        if paper_context.get("dependencies"):
+            lines.append("## Known Dependencies")
+            for dep in paper_context["dependencies"][:20]:  # Limit to avoid too long
+                lines.append(f"  - {dep}")
+            lines.append("")
+        
+        if paper_context.get("models"):
+            lines.append("## Models to Use")
+            for model in paper_context["models"][:10]:
+                lines.append(f"  - {model}")
+            lines.append("")
+        
+        if paper_context.get("datasets"):
+            lines.append("## Datasets to Use")
+            for dataset in paper_context["datasets"][:10]:
+                lines.append(f"  - {dataset}")
+            lines.append("")
+        
+        if paper_context.get("methods"):
+            lines.append("## Methods to Implement")
+            for method in paper_context["methods"][:10]:
+                lines.append(f"  - {method}")
+            lines.append("")
+        
+        if paper_context.get("experiments"):
+            lines.append("## Experiments to Run")
+            for exp in paper_context["experiments"][:10]:
+                lines.append(f"  - {exp}")
+            lines.append("")
+        
+        if paper_context.get("metrics"):
+            lines.append("## Metrics to Calculate")
+            for metric in paper_context["metrics"][:10]:
+                lines.append(f"  - {metric}")
+            lines.append("")
+        
+        # Files created by previous agents
+        if files_created:
+            lines.append("## Files Already Created (by previous agents)")
+            for agent_name, files in files_created.items():
+                if files:
+                    lines.append(f"  {agent_name}:")
+                    for f in files[:10]:  # Limit per agent
+                        lines.append(f"    - {f}")
+            lines.append("")
+        
+        # Reproduce steps so far
+        if reproduce_steps:
+            lines.append("## Reproduction Steps (add yours to this list)")
+            for i, step in enumerate(reproduce_steps[:20], 1):
+                lines.append(f"  {i}. {step}")
+            lines.append("")
+        
+        return "\n".join(lines) if lines else ""
+
     async def run(
         self,
         instructions_path: str = "/workspace/instructions.md",
@@ -255,86 +338,127 @@ PYTHONSCRIPT'''
         for role in workflow:
             callback_count[role] = 0
 
+        # Retry configuration for transient errors
+        max_retries = 3
+        retry_delay_base = 5  # seconds
+
         # Execute workflow with callback support
         i = 0
         while i < len(workflow):
             agent_role = workflow[i]
             
-            try:
-                logger.info(f"Running agent: {agent_role.value} (run #{callback_count[agent_role] + 1})")
-                agent = self.agents[agent_role]
-
-                # Create context for agent
-                context = self._build_agent_context(
-                    agent_role, instructions, rubric, workflow
-                )
-
-                # Run agent
-                result = await agent.run(
-                    context=context, max_iterations=max_iterations_per_agent
-                )
-
-                # Update shared state
-                self.shared_state["agent_outputs"][agent_role.value] = result
-                if agent_role.value not in self.shared_state["agents_completed"]:
-                    self.shared_state["agents_completed"].append(agent_role.value)
-                self.save_shared_state()
-
-                # Check if agent requests a callback to another agent
-                if result.get("callback_agent"):
-                    callback_target = result.get("callback_agent")
-                    callback_reason = result.get("callback_reason", "No reason provided")
+            # Retry loop for transient errors
+            last_error = None
+            for retry_attempt in range(max_retries):
+                try:
+                    if retry_attempt > 0:
+                        logger.info(f"Retry attempt {retry_attempt + 1}/{max_retries} for agent: {agent_role.value}")
+                    else:
+                        logger.info(f"Running agent: {agent_role.value} (run #{callback_count[agent_role] + 1})")
                     
-                    # Find the target agent role
-                    target_role = None
-                    for role in workflow:
-                        if role.value == callback_target:
-                            target_role = role
-                            break
-                    
-                    if target_role and total_callbacks < max_total_callbacks:
-                        if callback_count[target_role] < max_callbacks_per_agent:
-                            logger.info(f"🔄 Agent {agent_role.value} requests callback to {callback_target}")
-                            logger.info(f"   Reason: {callback_reason}")
-                            
-                            # Insert the callback agent right after current position
-                            workflow.insert(i + 1, target_role)
-                            callback_count[target_role] += 1
-                            total_callbacks += 1
-                            
-                            # Log callback event
-                            self.shared_state["callback_events"] = self.shared_state.get("callback_events", [])
-                            self.shared_state["callback_events"].append({
-                                "from_agent": agent_role.value,
-                                "to_agent": callback_target,
-                                "reason": callback_reason,
-                                "callback_number": callback_count[target_role]
-                            })
-                            self.save_shared_state()
-                        else:
-                            logger.warning(f"⚠️  Agent {callback_target} has reached max callbacks ({max_callbacks_per_agent}), ignoring request")
-                    elif total_callbacks >= max_total_callbacks:
-                        logger.warning(f"⚠️  Max total callbacks ({max_total_callbacks}) reached, ignoring request")
-                    elif not target_role:
-                        logger.warning(f"⚠️  Unknown callback target: {callback_target}")
+                    agent = self.agents[agent_role]
 
-                # Check if agent indicates we should stop
-                if result.get("status") == "error" and result.get("fatal", False):
-                    logger.error(
-                        f"Fatal error in {agent_role.value}, stopping workflow"
+                    # Create context for agent
+                    context = self._build_agent_context(
+                        agent_role, instructions, rubric, workflow
                     )
+
+                    # Run agent
+                    result = await agent.run(
+                        context=context, max_iterations=max_iterations_per_agent
+                    )
+
+                    # Update shared state
+                    self.shared_state["agent_outputs"][agent_role.value] = result
+                    if agent_role.value not in self.shared_state["agents_completed"]:
+                        self.shared_state["agents_completed"].append(agent_role.value)
+                    self.save_shared_state()
+
+                    # Check if agent requests a callback to another agent
+                    if result.get("callback_agent"):
+                        callback_target = result.get("callback_agent")
+                        callback_reason = result.get("callback_reason", "No reason provided")
+                        
+                        # Find the target agent role
+                        target_role = None
+                        for role in workflow:
+                            if role.value == callback_target:
+                                target_role = role
+                                break
+                        
+                        if target_role and total_callbacks < max_total_callbacks:
+                            if callback_count[target_role] < max_callbacks_per_agent:
+                                logger.info(f"🔄 Agent {agent_role.value} requests callback to {callback_target}")
+                                logger.info(f"   Reason: {callback_reason}")
+                                
+                                # Insert the callback agent right after current position
+                                workflow.insert(i + 1, target_role)
+                                callback_count[target_role] += 1
+                                total_callbacks += 1
+                                
+                                # Log callback event
+                                self.shared_state["callback_events"] = self.shared_state.get("callback_events", [])
+                                self.shared_state["callback_events"].append({
+                                    "from_agent": agent_role.value,
+                                    "to_agent": callback_target,
+                                    "reason": callback_reason,
+                                    "callback_number": callback_count[target_role]
+                                })
+                                self.save_shared_state()
+                            else:
+                                logger.warning(f"⚠️  Agent {callback_target} has reached max callbacks ({max_callbacks_per_agent}), ignoring request")
+                        elif total_callbacks >= max_total_callbacks:
+                            logger.warning(f"⚠️  Max total callbacks ({max_total_callbacks}) reached, ignoring request")
+                        elif not target_role:
+                            logger.warning(f"⚠️  Unknown callback target: {callback_target}")
+
+                    # Check if agent indicates we should stop
+                    if result.get("status") == "error" and result.get("fatal", False):
+                        logger.error(
+                            f"Fatal error in {agent_role.value}, stopping workflow"
+                        )
+                        break
+
+                    # Success - break out of retry loop
+                    last_error = None
                     break
 
-                # Move to next agent
-                i += 1
-
-            except Exception as e:
-                logger.error(f"Error running {agent_role.value}: {e}")
-                self.shared_state["errors"].append(
-                    {"agent": agent_role.value, "error": str(e)}
-                )
-                self.save_shared_state()
-                i += 1
+                except Exception as e:
+                    last_error = e
+                    error_str = str(e)
+                    
+                    # Check if this is a retryable error (500 errors, timeouts, connection issues)
+                    is_retryable = any(x in error_str.lower() for x in [
+                        '500', 'internal server error', 'timeout', 'timed out',
+                        'connection', 'temporarily unavailable', 'service unavailable'
+                    ])
+                    
+                    if is_retryable and retry_attempt < max_retries - 1:
+                        # Calculate delay with exponential backoff
+                        delay = retry_delay_base * (2 ** retry_attempt)
+                        logger.warning(f"⚠️  Retryable error in {agent_role.value}: {error_str[:200]}")
+                        logger.info(f"   Waiting {delay}s before retry...")
+                        await asyncio.sleep(delay)
+                    else:
+                        # Non-retryable error or max retries reached
+                        if retry_attempt >= max_retries - 1:
+                            logger.error(f"❌ Max retries ({max_retries}) reached for {agent_role.value}")
+                        logger.error(f"Error running {agent_role.value}: {e}")
+                        self.shared_state["agent_outputs"][agent_role.value] = {
+                            "status": "error",
+                            "agent": agent.__class__.__name__,
+                            "error": str(e),
+                            "fatal": False,
+                            "retries_attempted": retry_attempt + 1
+                        }
+                        self.shared_state["errors"].append(
+                            {"agent": agent_role.value, "error": str(e), "retries": retry_attempt + 1}
+                        )
+                        self.save_shared_state()
+                        break
+            
+            # Move to next agent
+            i += 1
 
         # Finalize submission
         await self._finalize_submission()
@@ -360,6 +484,9 @@ PYTHONSCRIPT'''
                     "agent_outputs"
                 ][prev_role.value]
 
+        # Format shared context for inclusion in prompts
+        shared_context_str = self.format_shared_context()
+
         context = {
             "task_name": self.task_name,
             "instructions": instructions,
@@ -368,6 +495,7 @@ PYTHONSCRIPT'''
             "submission_path": self.submission_path,
             "previous_agent_outputs": previous_outputs,
             "shared_state": self.shared_state,
+            "shared_context_summary": shared_context_str,  # New: formatted context string
         }
 
         # Add role-specific context
@@ -391,11 +519,11 @@ PYTHONSCRIPT'''
         return context
 
     async def _finalize_submission(self) -> None:
-        """Finalize the submission by creating reproduce.sh and README.md."""
+        """Finalize the submission by creating reproduce.sh and README.md if they don't exist."""
         logger.info("Finalizing submission")
 
-        # Create reproduce.sh script
-        reproduce_script = """#!/bin/bash
+        # Fallback reproduce.sh script (only used if agents didn't create one)
+        fallback_reproduce_script = """#!/bin/bash
 set -e
 
 # Reproduction script for paper reproduction
@@ -416,20 +544,42 @@ echo "Reproduction completed!"
                 logger.warning(f"Failed to create submission directory: {result.stderr}")
                 return
             
-            # Create reproduce.sh using heredoc
-            result = self.workspace.execute_command(
-                f'''cat > {self.submission_path}/reproduce.sh << 'REPRODUCE_EOF'
-{reproduce_script}
+            # Check if reproduce.sh already exists and has meaningful content
+            check_result = self.workspace.execute_command(
+                f"test -s {self.submission_path}/reproduce.sh && wc -l < {self.submission_path}/reproduce.sh"
+            )
+            reproduce_exists = check_result.exit_code == 0
+            reproduce_lines = 0
+            if reproduce_exists:
+                try:
+                    reproduce_lines = int(check_result.stdout.strip())
+                except (ValueError, AttributeError):
+                    reproduce_lines = 0
+            
+            # Only create reproduce.sh if it doesn't exist or has very little content (< 10 lines)
+            if not reproduce_exists or reproduce_lines < 10:
+                if reproduce_exists and reproduce_lines > 0:
+                    logger.info(f"reproduce.sh exists but only has {reproduce_lines} lines, keeping agent version")
+                else:
+                    logger.info("No reproduce.sh found, creating fallback template")
+                    result = self.workspace.execute_command(
+                        f'''cat > {self.submission_path}/reproduce.sh << 'REPRODUCE_EOF'
+{fallback_reproduce_script}
 REPRODUCE_EOF
 chmod +x {self.submission_path}/reproduce.sh'''
-            )
-            if result.exit_code != 0:
-                logger.warning(f"Failed to create reproduce.sh: {result.stderr}")
+                    )
+                    if result.exit_code != 0:
+                        logger.warning(f"Failed to create reproduce.sh: {result.stderr}")
+            else:
+                logger.info(f"Keeping existing reproduce.sh ({reproduce_lines} lines)")
+                # Just ensure it's executable
+                self.workspace.execute_command(f"chmod +x {self.submission_path}/reproduce.sh")
+                
         except Exception as e:
-            logger.warning(f"Failed to create reproduce.sh: {e}")
+            logger.warning(f"Failed to handle reproduce.sh: {e}")
 
-        # Create README.md
-        readme_content = f"""# Paper Reproduction: {self.task_name}
+        # Fallback README.md content
+        fallback_readme = f"""# Paper Reproduction: {self.task_name}
 
 This repository contains the reproduction of the research paper.
 
@@ -452,14 +602,34 @@ See shared_state.json for detailed outputs from each agent.
 """
 
         try:
-            # Create README.md using heredoc
-            result = self.workspace.execute_command(
-                f'''cat > {self.submission_path}/README.md << 'README_EOF'
-{readme_content}
-README_EOF'''
+            # Check if README.md already exists and has meaningful content
+            check_result = self.workspace.execute_command(
+                f"test -s {self.submission_path}/README.md && wc -l < {self.submission_path}/README.md"
             )
-            if result.exit_code != 0:
-                logger.warning(f"Failed to create README.md: {result.stderr}")
+            readme_exists = check_result.exit_code == 0
+            readme_lines = 0
+            if readme_exists:
+                try:
+                    readme_lines = int(check_result.stdout.strip())
+                except (ValueError, AttributeError):
+                    readme_lines = 0
+            
+            # Only create README.md if it doesn't exist or has very little content (< 10 lines)
+            if not readme_exists or readme_lines < 10:
+                if readme_exists and readme_lines > 0:
+                    logger.info(f"README.md exists but only has {readme_lines} lines, keeping agent version")
+                else:
+                    logger.info("No README.md found, creating fallback template")
+                    result = self.workspace.execute_command(
+                        f'''cat > {self.submission_path}/README.md << 'README_EOF'
+{fallback_readme}
+README_EOF'''
+                    )
+                    if result.exit_code != 0:
+                        logger.warning(f"Failed to create README.md: {result.stderr}")
+            else:
+                logger.info(f"Keeping existing README.md ({readme_lines} lines)")
+                
         except Exception as e:
-            logger.warning(f"Failed to create README.md: {e}")
+            logger.warning(f"Failed to handle README.md: {e}")
 

@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 import httpx
@@ -130,14 +131,67 @@ git checkout main
         raise RuntimeError(f"Failed to checkout files: {result.stderr}")
     
     # Step 3: Install and use Git LFS to pull actual file content (not pointers)
-    # Increase timeout to 300 seconds for large files
-    lfs_cmd = f"""cd /tmp/frontier-evals && \\
-(git lfs install 2>&1 || true) && \\
-(timeout 300 git lfs pull --include="project/paperbench/data/papers/{task_name}/*" 2>&1 || echo "LFS pull completed or not needed")
+    # Use a more robust approach with retries and proper timeout coordination
+    logger.info("Attempting to download Git LFS files...")
+    
+    lfs_success = False
+    for attempt in range(3):  # Try up to 3 times
+        logger.info(f"Git LFS attempt {attempt + 1}/3...")
+        
+        # Method 1: Try git lfs pull with proper include pattern
+        lfs_cmd = f"""cd /tmp/frontier-evals && \\
+git lfs install --skip-smudge 2>&1 || true
+git lfs pull --include="project/paperbench/data/papers/{task_name}/*" 2>&1
 """
-    result = workspace.execute_command(lfs_cmd, timeout=150)
-    if result.exit_code != 0:
-        logger.warning(f"Git LFS pull had issues: {result.stderr}, continuing...")
+        result = workspace.execute_command(lfs_cmd, timeout=180)
+        
+        # Check if paper.md has actual content
+        check_result = workspace.execute_command(f"head -1 /tmp/frontier-evals/project/paperbench/data/papers/{task_name}/paper.md 2>&1")
+        if check_result.exit_code == 0 and "git-lfs.github.com" not in check_result.stdout:
+            logger.info(f"✅ Git LFS pull succeeded on attempt {attempt + 1}")
+            lfs_success = True
+            break
+        
+        # Method 2: Try git lfs fetch + checkout
+        if not lfs_success:
+            logger.info("Trying git lfs fetch + checkout...")
+            fetch_cmd = f"""cd /tmp/frontier-evals && \\
+git lfs fetch --include="project/paperbench/data/papers/{task_name}/*" 2>&1 && \\
+git lfs checkout "project/paperbench/data/papers/{task_name}/*" 2>&1
+"""
+            result = workspace.execute_command(fetch_cmd, timeout=180)
+            
+            check_result = workspace.execute_command(f"head -1 /tmp/frontier-evals/project/paperbench/data/papers/{task_name}/paper.md 2>&1")
+            if check_result.exit_code == 0 and "git-lfs.github.com" not in check_result.stdout:
+                logger.info(f"✅ Git LFS fetch+checkout succeeded on attempt {attempt + 1}")
+                lfs_success = True
+                break
+        
+        if attempt < 2:
+            logger.warning(f"LFS attempt {attempt + 1} failed, retrying...")
+            time.sleep(2)  # Small delay before retry
+    
+    if not lfs_success:
+        logger.warning("⚠️ Git LFS download failed after 3 attempts. Trying direct download fallback...")
+        
+        # Method 3: Fallback - download paper.md directly via raw GitHub URL
+        # For LFS files, we need to use the GitHub API or download the actual blob
+        fallback_cmd = f"""cd /tmp/frontier-evals/project/paperbench/data/papers/{task_name} && \\
+# Read the LFS pointer to get the OID
+if head -1 paper.md | grep -q "git-lfs"; then
+    OID=$(grep "^oid sha256:" paper.md | cut -d: -f2)
+    if [ -n "$OID" ]; then
+        echo "Attempting to download LFS object: $OID"
+        # Try GitHub LFS batch API
+        curl -sL "https://github.com/openai/frontier-evals.git/info/lfs/objects/batch" \\
+            -H "Accept: application/vnd.git-lfs+json" \\
+            -H "Content-Type: application/vnd.git-lfs+json" \\
+            -d '{{"operation": "download", "transfers": ["basic"], "objects": [{{"oid": "'$OID'", "size": 0}}]}}' \\
+            2>&1 || echo "LFS API call completed"
+    fi
+fi
+"""
+        workspace.execute_command(fallback_cmd, timeout=60)
     
     # Step 4: Copy files to workspace
     copy_cmd = f"""cp -r /tmp/frontier-evals/project/paperbench/data/papers/{task_name}/* /workspace/paper/ 2>&1
@@ -156,18 +210,16 @@ git checkout main
     logger.info(f"Checking paper.md content (first 5 lines):\n{check_content.stdout[:200]}")
     
     if "version https://git-lfs.github.com/spec/v1" in check_content.stdout:
-        logger.warning("⚠️  paper.md is a Git LFS pointer! Attempting to download actual content...")
-        # Try to get LFS files directly - use fetch then checkout (with longer timeout)
+        logger.warning("⚠️  paper.md is still a Git LFS pointer after initial attempts!")
+        
+        # Final fallback: try one more time with fetch --all (slower but more reliable)
+        logger.info("Trying final fallback with git lfs fetch --all...")
         lfs_fetch_cmd = f"""cd /tmp/frontier-evals && \\
-timeout 120 git lfs fetch --all 2>&1 && \\
-timeout 60 git lfs checkout 'project/paperbench/data/papers/{task_name}/*' 2>&1 && \\
+git lfs fetch --all 2>&1 && \\
+git lfs checkout 2>&1 && \\
 cp -rf project/paperbench/data/papers/{task_name}/* /workspace/paper/ 2>&1
 """
-        result = workspace.execute_command(lfs_fetch_cmd, timeout=200)
-        logger.info(f"Git LFS fetch/checkout result (exit {result.exit_code}):")
-        logger.info(f"  stdout: {result.stdout[-300:] if result.stdout else 'empty'}")
-        if result.stderr:
-            logger.warning(f"  stderr: {result.stderr[-300:]}")
+        result = workspace.execute_command(lfs_fetch_cmd, timeout=300)
         
         # Verify the file was replaced
         check_again = workspace.execute_command("head -10 /workspace/paper/paper.md 2>&1")
@@ -176,6 +228,9 @@ cp -rf project/paperbench/data/papers/{task_name}/* /workspace/paper/ 2>&1
         else:
             logger.warning("⚠️  Git LFS files still not downloaded - paper.md is still a pointer")
             logger.warning("The agent will work with available files (rubric.json, config.yaml, etc.)")
+            # Log what files ARE available so we know what the agent can use
+            available_files = workspace.execute_command("ls -la /workspace/paper/")
+            logger.info(f"Available files for agent:\n{available_files.stdout}")
     
     # Final verification with detailed logging
     file_count_result = workspace.execute_command("ls /workspace/paper | wc -l")
@@ -495,7 +550,7 @@ def main() -> None:
         "--task-name",
         type=str,
         required=True,
-        help="Task name (paper ID)",
+        help="Task name(s) - single paper ID or comma-separated list (e.g., 'pinn,rice,other')",
     )
     parser.add_argument(
         "--instructions-path",
@@ -554,42 +609,28 @@ def main() -> None:
         llm_config = f.read()
     llm = LLM.model_validate_json(llm_config)
     
-    # Construct output directory
-    dataset_description = f"paperbench-{args.task_name}"
-    structured_output_dir = construct_eval_output_dir(
-        base_dir=args.output_dir,
-        dataset_name=dataset_description,
-        model_name=llm.model,
-        max_iterations=args.max_iterations,
-        eval_note=args.note,
-    )
-    
     # Configure API call logging
     # Logs are written inside the Docker container and copied back after inference
     container_log_dir = "/workspace/logs/completions"  # Path inside Docker
-    host_log_dir = args.log_completions_dir
-    if host_log_dir is None:
-        host_log_dir = os.path.join(structured_output_dir, "logs", "completions")
     
     if args.log_completions:
         # Enable logging inside the Docker container
         llm.log_completions = True
         llm.log_completions_folder = container_log_dir
         logger.info(f"✅ API call logging enabled (inside container: {container_log_dir})")
-        logger.info(f"   Logs will be copied to host at: {host_log_dir}")
     else:
         logger.info("ℹ️  API call logging disabled (use --log-completions to enable)")
     
     logger.info("Using LLM config: %s", llm.model_dump_json(indent=2))
 
-    # Create workspace (always builds with --platform linux/amd64)
-    workspace = get_config_for_task(
-        task_name=args.task_name,
-        base_image=args.base_image,
-        enable_gpu=args.enable_gpu,
-    )
+    # Parse task names (comma-separated)
+    task_names = [t.strip() for t in args.task_name.split(",") if t.strip()]
+    if not task_names:
+        raise ValueError("No valid task names provided")
+    
+    logger.info(f"Will run inference for {len(task_names)} task(s): {task_names}")
 
-    # Resolve instructions path
+    # Resolve instructions path (do this once, outside the loop)
     instructions_path = args.instructions_path
     if not os.path.isabs(instructions_path):
         # Try relative to project root first
@@ -608,66 +649,125 @@ def main() -> None:
             else:
                 logger.warning(f"Instructions file not found: {args.instructions_path}")
 
-    # Run inference using workspace context manager (synchronous)
-    with workspace:
-        # Create log directory inside container if logging is enabled
-        if args.log_completions:
-            workspace.execute_command(f"mkdir -p {container_log_dir}")
-            logger.info(f"Created log directory in container: {container_log_dir}")
+    # Track results for all tasks
+    all_results = {}
+    
+    # Run inference for each task sequentially
+    for task_idx, task_name in enumerate(task_names, 1):
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Starting task {task_idx}/{len(task_names)}: {task_name}")
+        logger.info(f"{'='*60}")
         
-        # Initialize task environment
-        init_task_environment(workspace, args.task_name, instructions_path)
+        # Construct output directory for this task
+        dataset_description = f"paperbench-{task_name}"
+        task_output_dir = construct_eval_output_dir(
+            base_dir=args.output_dir,
+            dataset_name=dataset_description,
+            model_name=llm.model,
+            max_iterations=args.max_iterations,
+            eval_note=args.note,
+        )
+        
+        # Configure log directory for this task
+        task_host_log_dir = args.log_completions_dir
+        if task_host_log_dir is None:
+            task_host_log_dir = os.path.join(task_output_dir, "logs", "completions")
+        
+        # Create workspace for this task
+        workspace = get_config_for_task(
+            task_name=task_name,
+            base_image=args.base_image,
+            enable_gpu=args.enable_gpu,
+        )
 
-        # Resolve rubric path if provided
-        rubric_path = None
-        if args.rubric_path:
-            if os.path.exists(args.rubric_path):
-                # Copy rubric to workspace
-                with open(args.rubric_path, "r") as f:
-                    rubric_content = f.read()
-                result = workspace.execute_command(
-                    f'''cat > /workspace/paper/rubric.json << "RUBRICEOF"
+        try:
+            # Run inference using workspace context manager (synchronous)
+            with workspace:
+                # Create log directory inside container if logging is enabled
+                if args.log_completions:
+                    workspace.execute_command(f"mkdir -p {container_log_dir}")
+                    logger.info(f"Created log directory in container: {container_log_dir}")
+        
+                # Initialize task environment
+                init_task_environment(workspace, task_name, instructions_path)
+
+                # Resolve rubric path if provided
+                rubric_path = None
+                if args.rubric_path:
+                    if os.path.exists(args.rubric_path):
+                        # Copy rubric to workspace
+                        with open(args.rubric_path, "r") as f:
+                            rubric_content = f.read()
+                        result = workspace.execute_command(
+                            f'''cat > /workspace/paper/rubric.json << "RUBRICEOF"
 {rubric_content}
 RUBRICEOF'''
-                )
-                if result.exit_code == 0:
-                    rubric_path = "/workspace/paper/rubric.json"
-                else:
-                    logger.warning(f"Failed to copy rubric: {result.stderr}")
-            else:
-                logger.warning(f"Rubric file not found: {args.rubric_path}")
+                        )
+                        if result.exit_code == 0:
+                            rubric_path = "/workspace/paper/rubric.json"
+                        else:
+                            logger.warning(f"Failed to copy rubric: {result.stderr}")
+                    else:
+                        logger.warning(f"Rubric file not found: {args.rubric_path}")
 
-        # Run multi-agent inference (async)
-        result = asyncio.run(run_multi_agent_inference(
-            workspace=workspace,
-            llm=llm,
-            task_name=args.task_name,
-            instructions_path="/workspace/instructions.md",
-            rubric_path=rubric_path,
-            max_iterations_per_agent=args.max_iterations_per_agent,
-        ))
+                # Run multi-agent inference (async)
+                result = asyncio.run(run_multi_agent_inference(
+                    workspace=workspace,
+                    llm=llm,
+                    task_name=task_name,
+                    instructions_path="/workspace/instructions.md",
+                    rubric_path=rubric_path,
+                    max_iterations_per_agent=args.max_iterations_per_agent,
+                ))
 
-        # Extract submission
-        extract_submission(workspace, args.submission_dir, args.task_name)
+                # Extract submission
+                extract_submission(workspace, args.submission_dir, task_name)
+                
+                # Extract completion logs from container if logging was enabled
+                if args.log_completions:
+                    extract_logs_from_container(workspace, task_host_log_dir, container_log_dir)
+
+                # Save results
+                results_file = os.path.join(task_output_dir, "results.json")
+                os.makedirs(task_output_dir, exist_ok=True)
+                with open(results_file, "w") as f:
+                    json.dump(result, f, indent=2)
+
+                logger.info(f"Results saved to: {results_file}")
+                
+                # Log completion log location if enabled
+                if args.log_completions:
+                    logger.info(f"📝 API call logs saved to: {task_host_log_dir}")
+                    logger.info(f"   Each API request/response is saved as a separate JSON file")
+                
+                # Store result for this task
+                all_results[task_name] = {
+                    "status": "success",
+                    "result": result,
+                    "output_dir": task_output_dir,
+                }
+                
+        except Exception as e:
+            logger.error(f"Task {task_name} failed with error: {e}")
+            all_results[task_name] = {
+                "status": "error",
+                "error": str(e),
+            }
+            # Continue with next task
+            continue
         
-        # Extract completion logs from container if logging was enabled
-        if args.log_completions:
-            extract_logs_from_container(workspace, host_log_dir, container_log_dir)
+        logger.info(f"Completed task {task_idx}/{len(task_names)}: {task_name}")
 
-        # Save results
-        results_file = os.path.join(structured_output_dir, "results.json")
-        os.makedirs(structured_output_dir, exist_ok=True)
-        with open(results_file, "w") as f:
-            json.dump(result, f, indent=2)
-
-        logger.info(f"Results saved to: {results_file}")
-        
-        # Log completion log location if enabled
-        if args.log_completions:
-            logger.info(f"📝 API call logs saved to: {host_log_dir}")
-            logger.info(f"   Each API request/response is saved as a separate JSON file")
-
-    logger.info("Inference completed!")
+    # Summary
+    logger.info(f"\n{'='*60}")
+    logger.info("All tasks completed!")
+    logger.info(f"{'='*60}")
+    for task_name, task_result in all_results.items():
+        status = task_result.get('status', 'unknown')
+        if status == 'success':
+            logger.info(f"  ✅ {task_name}: {status} -> {task_result.get('output_dir', 'N/A')}")
+        else:
+            logger.info(f"  ❌ {task_name}: {status} - {task_result.get('error', 'Unknown error')}")
 
 
 if __name__ == "__main__":

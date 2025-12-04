@@ -6,15 +6,18 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 
 def _get_submodule_sha(submodule_path: Path) -> str:
+    """Get the actual HEAD SHA from the submodule directory."""
     try:
+        # Use git rev-parse HEAD in the submodule directory to get the actual checked-out SHA
+        # This matches what build_utils.py does
         result = subprocess.run(
-            ["git", "submodule", "status", str(submodule_path)],
+            ["git", "rev-parse", "HEAD"],
+            cwd=submodule_path,
             capture_output=True,
             text=True,
             check=True,
         )
-        sha = result.stdout.strip().split()[0].lstrip("+-")
-        return sha
+        return result.stdout.strip()
     except subprocess.CalledProcessError:
         # Fallback if submodule is not properly initialized
         return "unknown"
