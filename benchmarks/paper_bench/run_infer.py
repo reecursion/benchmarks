@@ -170,7 +170,13 @@ def init_task_environment(
                     return False
         
         # Copy each file from local cache to workspace
+        # Skip rubric.json - agents should not have access to evaluation criteria
+        EXCLUDED_FILES = {"rubric.json"}
+        
         for filename in os.listdir(local_paper_path):
+            if filename in EXCLUDED_FILES:
+                logger.info(f"  Skipped (excluded): {filename}")
+                continue
             src_path = os.path.join(local_paper_path, filename)
             if os.path.isfile(src_path):
                 dest_path = f"/workspace/paper/{filename}"
@@ -316,8 +322,9 @@ fi
 """
         workspace.execute_command(fallback_cmd, timeout=60)
     
-    # Step 4: Copy files to workspace
-    copy_cmd = f"""cp -r /tmp/frontier-evals/project/paperbench/data/papers/{task_name}/* /workspace/paper/ 2>&1
+    # Step 4: Copy files to workspace (excluding rubric.json - agents shouldn't see evaluation criteria)
+    copy_cmd = f"""cp -r /tmp/frontier-evals/project/paperbench/data/papers/{task_name}/* /workspace/paper/ 2>&1 && \\
+rm -f /workspace/paper/rubric.json 2>&1 || true
 """
     result = workspace.execute_command(copy_cmd)
     if result.exit_code != 0:
@@ -340,7 +347,8 @@ fi
         lfs_fetch_cmd = f"""cd /tmp/frontier-evals && \\
 git lfs fetch --all 2>&1 && \\
 git lfs checkout 2>&1 && \\
-cp -rf project/paperbench/data/papers/{task_name}/* /workspace/paper/ 2>&1
+cp -rf project/paperbench/data/papers/{task_name}/* /workspace/paper/ 2>&1 && \\
+rm -f /workspace/paper/rubric.json 2>&1 || true
 """
         result = workspace.execute_command(lfs_fetch_cmd, timeout=300)
         
