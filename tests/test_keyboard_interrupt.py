@@ -25,7 +25,6 @@ sys.path.insert(0, "{project_root}")
 from benchmarks.utils.evaluation import Evaluation
 from benchmarks.utils.models import EvalInstance, EvalMetadata, EvalOutput
 from openhands.sdk import LLM
-from openhands.sdk.critic import PassCritic
 from openhands.sdk.workspace import RemoteWorkspace
 
 
@@ -69,7 +68,6 @@ if __name__ == "__main__":
         eval_limit=0,
         max_attempts=1,
         max_retries=0,
-        critic=PassCritic(),
     )
 
     evaluation = TestEvaluation(metadata=metadata, num_workers=4)

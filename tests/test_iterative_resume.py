@@ -6,10 +6,10 @@ import tempfile
 from typing import List
 from unittest.mock import Mock
 
+from benchmarks.utils.critics import PassCritic
 from benchmarks.utils.evaluation import Evaluation
 from benchmarks.utils.models import EvalInstance, EvalMetadata, EvalOutput
 from openhands.sdk import LLM
-from openhands.sdk.critic import PassCritic
 from openhands.sdk.workspace import RemoteWorkspace
 
 

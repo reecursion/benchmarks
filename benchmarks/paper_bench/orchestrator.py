@@ -105,9 +105,24 @@ class MultiAgentOrchestrator:
                 "experiments": [],  # Experiments to reproduce
                 "metrics": [],  # Metrics to calculate
                 "key_results": [],  # Key results from paper tables/figures
+                # NEW: Track all algorithms for completeness checking
+                "all_algorithms": [],  # ALL algorithms mentioned in paper (main + baselines)
+                "implemented_algorithms": [],  # Algorithms actually implemented
+                "missing_algorithms": [],  # Algorithms not implemented (with reasons)
+                "baseline_algorithms": [],  # Specifically baseline/comparison methods
             },
             "files_created": {},  # Dict mapping agent_name -> list of files created
             "reproduce_steps": [],  # Ordered list of commands for reproduce.sh
+            # NEW: Track implementation completeness
+            "implementation_status": {
+                "main_method": None,
+                "baselines_required": [],
+                "baselines_implemented": [],
+                "completion_percentage": 0,
+            },
+            # NEW: Track critical failures for recovery
+            "infrastructure_failed": False,
+            "critical_failure": None,
         }
 
         # Initialize agents
@@ -460,11 +475,40 @@ PYTHONSCRIPT'''
             # Move to next agent
             i += 1
 
+        # Check for critical failures and set recovery flags
+        self._check_critical_failures()
+
         # Finalize submission
         await self._finalize_submission()
 
         logger.info("Multi-agent reproduction workflow completed")
         return self.shared_state
+
+    def _check_critical_failures(self) -> None:
+        """Check for critical agent failures and set appropriate flags for recovery."""
+        critical_agents = [AgentRole.INFRASTRUCTURE, AgentRole.METHOD_IMPLEMENTATION]
+        
+        for critical_role in critical_agents:
+            output = self.shared_state["agent_outputs"].get(critical_role.value, {})
+            if output.get("status") == "error":
+                logger.warning(f"⚠️  Critical agent {critical_role.value} failed - submission may be incomplete")
+                self.shared_state["critical_failure"] = critical_role.value
+                
+                # For infrastructure failure, set recovery flag for subsequent agents
+                if critical_role == AgentRole.INFRASTRUCTURE:
+                    logger.info("Infrastructure failed - downstream agents will attempt recovery")
+                    self.shared_state["infrastructure_failed"] = True
+                    # Set default dependencies that most papers need
+                    if not self.shared_state["paper_context"]["dependencies"]:
+                        self.shared_state["paper_context"]["dependencies"] = [
+                            "torch", "numpy", "scipy", "transformers", "datasets"
+                        ]
+                    self.save_shared_state()
+                    
+                # For method implementation failure, log what might be missing
+                if critical_role == AgentRole.METHOD_IMPLEMENTATION:
+                    logger.warning("Method implementation failed - reproduction will likely be incomplete")
+                    self.shared_state["implementation_status"]["completion_percentage"] = 0
 
     def _build_agent_context(
         self,

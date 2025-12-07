@@ -123,6 +123,8 @@ You should use HuggingFace Transformers, PyTorch, and the datasets library where
 {SHARED_MEMORY_INSTRUCTIONS}
 
 CRITICAL: Write code that DOWNLOADS models/datasets at runtime (in reproduce.sh), NOT code that saves downloaded models to the submission directory.
+
+RECOVERY MODE: If the Infrastructure agent failed, you must also handle basic environment setup.
 """
 
     def get_instruction(self, context: Dict[str, Any]) -> str:
@@ -131,27 +133,60 @@ CRITICAL: Write code that DOWNLOADS models/datasets at runtime (in reproduce.sh)
         submission_path = context.get("submission_path", "/home/submission")
         shared_context = context.get("shared_context_summary", "")
 
-        # Get infrastructure output
+        # Check if infrastructure failed
         infra_output = self._get_previous_agent_output("infrastructure")
+        infra_failed = infra_output is None or infra_output.get("status") == "error"
+        
+        # Check shared state for infrastructure failure flag
+        shared_state = self.shared_state or {}
+        infra_failed = infra_failed or shared_state.get("infrastructure_failed", False)
+        
+        recovery_section = ""
+        if infra_failed:
+            recovery_section = f"""
+⚠️  INFRASTRUCTURE AGENT FAILED - You must handle environment setup first:
+
+RECOVERY STEPS (do these BEFORE model/dataset loading):
+1. Read the paper at {paper_path}/paper.md to identify required packages
+2. Create requirements.txt in {submission_path} with all dependencies:
+   ```
+   torch>=1.10.0
+   transformers>=4.20.0
+   datasets
+   numpy
+   scipy
+   # Add paper-specific packages
+   ```
+3. Install dependencies: pip install -r {submission_path}/requirements.txt
+4. Verify installation by importing key packages
+5. Update shared state with dependencies you identified
+
+Then proceed with model/dataset loading below.
+"""
 
         return f"""You are the Model & Dataset Agent for reproducing the paper at {paper_path}.
 
 Task: {task_desc}
 
-Previous agent (Infrastructure) has set up the environment.
-
+Previous agent (Infrastructure) status: {"⚠️ FAILED - see recovery steps below" if infra_failed else "✓ completed"}
+{recovery_section}
 {shared_context}
 
 Steps:
-1. READ /workspace/shared_state/shared_state.json to see models/datasets identified by Infrastructure Agent
-2. Write Python scripts that will download models at runtime (NOT save actual model files)
-3. Write Python scripts that will download datasets at runtime (NOT save actual data files)
-4. Handle train/dev/test splits as specified in the paper
-5. Validate that your loading scripts work correctly (test loading a sample)
-6. Create data loading scripts in {submission_path}
-7. UPDATE /workspace/shared_state/shared_state.json with:
+1. {"FIRST: Complete recovery steps above, THEN proceed" if infra_failed else "READ /workspace/shared_state/shared_state.json to see models/datasets identified by Infrastructure Agent"}
+2. Identify all models mentioned in the paper (read {paper_path}/paper.md if needed)
+3. Identify all datasets mentioned in the paper
+4. Write Python scripts that will download models at runtime (NOT save actual model files)
+5. Write Python scripts that will download datasets at runtime (NOT save actual data files)
+6. Handle train/dev/test splits as specified in the paper
+7. Validate that your loading scripts work correctly (test loading a sample)
+8. Create data loading scripts in {submission_path}
+9. UPDATE /workspace/shared_state/shared_state.json with:
    - files_created.model_dataset: list of files you created
+   - paper_context.models: list of models identified
+   - paper_context.datasets: list of datasets identified
    - reproduce_steps: add commands to download models/datasets
+   {"- paper_context.dependencies: packages you installed (from recovery)" if infra_failed else ""}
 
 CRITICAL: Only save .py scripts to {submission_path}. The scripts should download models/datasets when executed.
 DO NOT save model weights (.pt, .pth, .ckpt, .safetensors) or dataset files to the submission directory.
@@ -165,12 +200,21 @@ class MethodImplementationAgent(BaseAgent):
         return f"""You are a Method Implementation Agent responsible for implementing research methods from papers.
 
 Your tasks include:
-- Implementing LoRA adapters, APT, MLP architectures
-- Implementing PINN loss functions
-- Implementing baselines (fine-tuning, Mask Tuning, CoFi, etc.)
-- Implementing coreset methods (EL2N, GraNd, etc.)
-- Implementing reward functions and reprogramming methods
+- Implementing the MAIN proposed method from the paper
+- Implementing ALL BASELINE methods mentioned for comparison
+- Implementing ALL VARIANT methods (e.g., "Method-Score", "Method-Fisher" variants)
+- Implementing any auxiliary algorithms described in the paper
 - Validating method correctness against paper descriptions
+
+CRITICAL: Research papers compare multiple methods. If the Experiments section mentions 
+comparing Method A against Baselines B, C, and D, you MUST implement ALL FOUR methods,
+not just Method A. Missing baselines will result in failed reproduction.
+
+Common patterns to look for:
+- "We compare against..." or "Baselines include..."
+- "Algorithm 1", "Algorithm 2", etc. - each needs implementation
+- Tables showing multiple methods - implement ALL methods in the table
+- Ablation variants like "Method-v1", "Method-v2", "Method+Feature"
 
 You should write clean, well-documented code that matches the paper's methodology.
 {SUBMISSION_GUIDELINES}
@@ -194,18 +238,62 @@ Previous agents have set up infrastructure and loaded models/datasets.
 
 {shared_context}
 
-Steps:
-1. READ /workspace/shared_state/shared_state.json to see what methods need to be implemented
-2. Implement core methods described in the paper
-3. Implement baseline methods mentioned
-4. Write clean, well-documented code in {submission_path}
-5. Test your implementation with simple examples
-6. Create unit tests if possible
-7. UPDATE /workspace/shared_state/shared_state.json with:
-   - files_created.method_implementation: list of files you created
-   - paper_context.methods: update with methods you implemented
+CRITICAL FIRST STEP - Algorithm Discovery:
+Before writing any code, thoroughly scan the paper to find ALL algorithms that need implementation:
 
-Implement step by step, testing each component. If code fails to run, debug by checking error messages and fixing issues iteratively.
+1. Read {paper_path}/paper.md and search for:
+   - The main proposed method (usually named in title or Abstract)
+   - "Baseline" or "baselines" - extract EVERY baseline method name
+   - "We compare" or "compared to" or "versus" - list all comparison methods  
+   - "Algorithm 1", "Algorithm 2", etc. - each numbered algorithm needs implementation
+   - Method variants like "X-ELBO", "X-Score", "X-Fisher", "X-Adam"
+   - Any method name appearing in experiment tables or figures
+
+2. Create an implementation checklist at {submission_path}/implementation_checklist.md:
+   ```markdown
+   # Implementation Checklist
+   
+   ## Main Method
+   - [ ] MethodName - file: method.py - status: not started
+   
+   ## Baselines (from Section X)
+   - [ ] Baseline1 - file: baseline1.py - status: not started
+   - [ ] Baseline2 - file: baseline2.py - status: not started
+   
+   ## Variants
+   - [ ] Method-Variant1 - file: variant1.py - status: not started
+   ```
+
+3. For EACH algorithm in the checklist:
+   - Create a dedicated .py file with a clear class or function
+   - Follow the paper's algorithm pseudocode exactly
+   - Include docstrings referencing paper section/equation numbers
+   - Add a smoke test in `if __name__ == "__main__":` block
+   - Update checklist status after implementation
+
+4. Test each implementation:
+   ```python
+   # Example smoke test at end of each file
+   if __name__ == "__main__":
+       # Minimal test to verify code runs
+       import numpy as np
+       method = MethodClass(...)
+       result = method.step(...)
+       print("Smoke test passed!")
+   ```
+
+5. UPDATE /workspace/shared_state/shared_state.json with:
+   - paper_context.all_algorithms: complete list of ALL algorithms found in paper
+   - paper_context.implemented_algorithms: list of what you actually implemented
+   - paper_context.missing_algorithms: any algorithms you couldn't implement (with reason)
+   - files_created.method_implementation: list of .py files created
+
+DO NOT:
+- Skip baselines because "they're not the main contribution" - IMPLEMENT ALL
+- Create config entries for methods without implementing the actual code
+- Move on until you've checked off ALL items in your checklist
+
+The grading will check that ALL methods mentioned in experiments are implemented, not just the main method.
 
 REMEMBER: Only save .py source files to {submission_path}. Do NOT save any generated outputs, checkpoints, or cache files.
 """
@@ -271,12 +359,17 @@ class ExperimentExecutionAgent(BaseAgent):
         return f"""You are an Experiment Execution Agent responsible for running experiments.
 
 Your tasks include:
+- VALIDATING that all algorithms referenced in configs are actually implemented
 - Executing training scripts with specific configurations
 - Running experiments across multiple seeds
 - Managing GPU resources and memory
 - Handling long-running experiments
 - Executing evaluation pipelines
-- Managing checkpoints and resuming from checkpoints
+
+CRITICAL: Before running any experiment, verify that all required code exists.
+If a config references an algorithm that isn't implemented, you should:
+1. Request a callback to method_implementation to implement it, OR
+2. Remove that algorithm from the config and document the gap
 
 You should run experiments efficiently and handle errors gracefully.
 {SUBMISSION_GUIDELINES}
@@ -284,6 +377,10 @@ You should run experiments efficiently and handle errors gracefully.
 CRITICAL: When testing experiments, save outputs OUTSIDE the submission directory (e.g., /workspace/outputs/).
 The submission directory should only contain the scripts that WILL run experiments, not the experiment outputs.
 The reproduce.sh script will generate all outputs when run during evaluation.
+
+CALLBACK SUPPORT: If you find missing implementations, request a callback:
+  "CALLBACK_REQUEST: method_implementation"
+  "CALLBACK_REASON: Missing implementations for algorithms: X, Y, Z"
 """
 
     def get_instruction(self, context: Dict[str, Any]) -> str:
@@ -311,18 +408,72 @@ Task: {task_desc}
 
 Previous agents have set up infrastructure, loaded models/datasets, implemented methods, and configured experiments.
 {shared_context_block}
-Steps:
+
+STEP 1 - VALIDATION (Do this FIRST before any experiments):
+Validate that all algorithms referenced in configs are actually implemented:
+
+```bash
+# List all Python implementation files
+echo "=== Implementation files ==="
+ls -la {submission_path}/*.py 2>/dev/null || echo "No .py files found"
+
+# Check what algorithms are referenced in config files
+echo "=== Algorithms in configs ==="
+grep -rh "algorithm\\|method\\|name:" {submission_path}/*.yaml {submission_path}/*.json 2>/dev/null | head -20 || true
+
+# Check implementation checklist if it exists
+echo "=== Implementation checklist ==="
+cat {submission_path}/implementation_checklist.md 2>/dev/null || echo "No checklist found"
+```
+
+For each algorithm mentioned in configs, verify it can be imported:
+```python
+# Test imports for each algorithm
+try:
+    from bam import BaM
+    print("✓ BaM")
+except ImportError as e:
+    print(f"✗ BaM: {{e}}")
+
+try:
+    from advi import ADVI  
+    print("✓ ADVI")
+except ImportError as e:
+    print(f"✗ ADVI: {{e}}")
+# ... repeat for each algorithm
+```
+
+If critical algorithms are MISSING, output:
+```
+CALLBACK_REQUEST: method_implementation
+CALLBACK_REASON: Missing implementations for: [list the missing algorithms]
+```
+
+STEP 2 - SMOKE TESTS:
+For each implemented algorithm, run a minimal test:
+```python
+# Quick validation that code runs without errors
+from algorithm import AlgorithmClass
+import numpy as np
+obj = AlgorithmClass(param1=..., param2=...)
+result = obj.step(...)  # or obj.run(...) or obj.forward(...)
+print(f"Algorithm test passed, output shape: {{result.shape if hasattr(result, 'shape') else type(result)}}")
+```
+
+STEP 3 - EXPERIMENT EXECUTION:
+Only after validation passes:
 1. Use the configuration files created by the previous agent
-2. Test training scripts work correctly (run briefly to verify)
-3. Ensure reproduce.sh will run the full experiments when executed
-4. Save experiment scripts to {submission_path}
-5. Save any intermediate test outputs to /workspace/outputs/ (NOT to submission)
+2. Create/update run_experiment.py that executes ALL implemented algorithms
+3. Test training scripts work correctly (run briefly to verify)
+4. Create reproduce.sh that will run full experiments
+5. Save experiment scripts to {submission_path}
+6. Save any intermediate test outputs to /workspace/outputs/ (NOT to submission)
 
 {SHARED_MEMORY_INSTRUCTIONS}
 
 CRITICAL: DO NOT save model checkpoints, weights, or large result files to {submission_path}.
 The reproduce.sh script should generate all outputs when run. Only save source code (.py, .sh) files.
-Test outputs and checkpoints should go to /workspace/outputs/ which is OUTSIDE the submission.
+If validation reveals missing implementations, request a callback - don't proceed with incomplete code.
 """
 
 
@@ -469,12 +620,13 @@ class ReportingAgent(BaseAgent):
         return f"""You are a Reporting Agent responsible for generating reports and documentation.
 
 Your tasks include:
+- AUDITING implementation completeness before finalizing
 - Logging experiment progress
 - Generating result reports (tables, figures)
 - Creating visualizations
-- Documenting findings and reproducibility
+- Documenting findings and reproducibility (including gaps)
 - Presenting results in various formats (CSV, JSON, LaTeX tables)
-- Creating comprehensive README files
+- Creating comprehensive README files with HONEST assessments
 
 You should create clear, comprehensive documentation of the reproduction effort.
 {SUBMISSION_GUIDELINES}
@@ -483,7 +635,7 @@ FINAL SUBMISSION REQUIREMENTS:
 The submission directory should contain ONLY:
 1. Python source code (.py files) - the implementation
 2. reproduce.sh - the main script that runs everything
-3. README.md - documentation of the reproduction
+3. README.md - documentation of the reproduction (including gaps)
 4. Config files (.yaml, .json) - experiment configurations
 5. requirements.txt or environment.yml - dependencies
 
@@ -515,24 +667,108 @@ Task: {task_desc}
 
 All previous agents have completed their tasks.
 {shared_context_block}
-Steps:
-1. Collect all outputs from previous agents
-2. Create a comprehensive README.md in {submission_path} documenting:
-   - What was accomplished
-   - How to reproduce the results
-   - What results are expected when running reproduce.sh
-   - What discrepancies may exist with the paper
-3. Ensure reproduce.sh script is complete and will run all experiments
-4. Test that reproduce.sh works correctly (run it briefly to verify)
-5. CLEANUP: Remove any non-essential files from {submission_path}:
-   - Delete any .pt, .pth, .ckpt, .safetensors model files
-   - Delete any __pycache__ directories
-   - Delete any .cache, wandb, mlruns directories
-   - Delete any data files or downloaded datasets
-   - Delete any result files (these should be generated by reproduce.sh)
-6. Verify the submission only contains: .py, .sh, .md, .yaml, .json, .txt, .cfg files
 
-Run: find {submission_path} -type f | head -50
-To verify the submission is clean before finishing.
+STEP 1 - COMPLETENESS AUDIT (Do this FIRST):
+Before writing documentation, audit what was actually implemented:
+
+```bash
+# List all Python implementation files
+echo "=== Python Files ==="
+find {submission_path} -name "*.py" -type f | sort
+
+# List all config files  
+echo "=== Config Files ==="
+find {submission_path} \\( -name "*.yaml" -o -name "*.json" \\) -type f | head -20
+
+# Check for implementation checklist
+echo "=== Implementation Checklist ==="
+cat {submission_path}/implementation_checklist.md 2>/dev/null || echo "No checklist found"
+
+# Check shared state for what was planned vs implemented
+echo "=== Shared State Summary ==="
+python3 -c "import json; s=json.load(open('/workspace/shared_state/shared_state.json')); print('All algorithms:', s.get('paper_context',{{}}).get('all_algorithms',[])); print('Implemented:', s.get('paper_context',{{}}).get('implemented_algorithms',[]))" 2>/dev/null || echo "Could not read shared state"
+```
+
+Analyze completeness:
+1. Read the paper's Experiments section to list ALL methods compared
+2. Check which methods have corresponding .py files in {submission_path}
+3. Calculate: completion_rate = (implemented / total_mentioned) * 100%
+4. Note any critical missing methods
+
+STEP 2 - CREATE HONEST README.md:
+Create {submission_path}/README.md with accurate status:
+
+```markdown
+# Paper Reproduction: [Paper Title from {paper_path}/paper.md]
+
+## Reproduction Status Summary
+
+### Implementation Completeness
+| Method | File | Status | Notes |
+|--------|------|--------|-------|
+| MainMethod | main.py | ✅ Complete | Follows Algorithm 1 |
+| Baseline1 | baseline1.py | ✅ Complete | Section 4.2 |
+| Baseline2 | - | ❌ Missing | Not implemented |
+| Variant1 | - | ❌ Missing | Not implemented |
+
+**Overall: X/Y methods implemented (Z%)**
+
+### What Works
+- [List implemented features that are tested and working]
+
+### Known Gaps  
+- [List what's missing and why it matters for full reproduction]
+- [Be specific: "ADVI baseline not implemented - needed for Table 2"]
+
+## How to Reproduce
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Run reproduction
+bash reproduce.sh
+```
+
+## Expected Outputs
+- [Describe what reproduce.sh will generate]
+- [Note which paper results can/cannot be reproduced due to gaps]
+
+## File Structure
+- `main_method.py` - Main algorithm implementation
+- `run_experiment.py` - Experiment runner
+- `reproduce.sh` - Full reproduction script
+```
+
+STEP 3 - VERIFY reproduce.sh:
+1. Check {submission_path}/reproduce.sh exists and is executable
+2. Verify it references all implemented methods
+3. Quick test: `timeout 60 bash {submission_path}/reproduce.sh` (with short timeout)
+
+STEP 4 - CLEANUP:
+Remove non-essential files from {submission_path}:
+```bash
+# Remove model files
+find {submission_path} -name "*.pt" -o -name "*.pth" -o -name "*.ckpt" -o -name "*.safetensors" | xargs rm -f 2>/dev/null
+
+# Remove cache directories
+rm -rf {submission_path}/__pycache__ {submission_path}/*/__pycache__ 2>/dev/null
+rm -rf {submission_path}/.cache {submission_path}/wandb {submission_path}/mlruns 2>/dev/null
+
+# Remove data files (keep only source code)
+find {submission_path} -name "*.npy" -o -name "*.pkl" -o -name "*.h5" | xargs rm -f 2>/dev/null
+```
+
+STEP 5 - FINAL VERIFICATION:
+```bash
+# List final contents
+echo "=== Final Submission Contents ==="
+find {submission_path} -type f | sort
+echo ""
+echo "=== Total size ==="
+du -sh {submission_path}
+```
+
+The submission should be lightweight (typically < 1MB, source code only).
 """
 
