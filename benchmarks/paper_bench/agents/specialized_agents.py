@@ -26,27 +26,41 @@ IMPORTANT SUBMISSION GUIDELINES:
 
 # Shared memory instructions for cross-agent communication
 SHARED_MEMORY_INSTRUCTIONS = """
-SHARED MEMORY - READ AND UPDATE:
+SHARED MEMORY - READ AND UPDATE (MANDATORY):
 The file /workspace/shared_state/shared_state.json contains shared information from previous agents.
-You should:
-1. READ it at the start to see what previous agents discovered
-2. UPDATE it with your findings before finishing
 
-To update shared state, use Python:
-```python
-import json
-with open('/workspace/shared_state/shared_state.json', 'r') as f:
-    state = json.load(f)
+MANDATORY STEPS (do these, not just document them):
+1. READ the shared state at the START of your work:
+   ```python
+   import json
+   with open('/workspace/shared_state/shared_state.json', 'r') as f:
+       state = json.load(f)
+   print("Current state:", json.dumps(state, indent=2))
+   ```
 
-# Add your contributions (examples):
-# state['paper_context']['dependencies'].extend(['torch', 'transformers'])
-# state['paper_context']['models'].append('roberta-base')
-# state['files_created']['your_agent_name'] = ['file1.py', 'file2.py']
-# state['reproduce_steps'].append('python train.py --config config.yaml')
+2. UPDATE the shared state at the END of your work - ACTUALLY RUN THIS CODE:
+   ```python
+   import json
+   
+   # Read current state
+   with open('/workspace/shared_state/shared_state.json', 'r') as f:
+       state = json.load(f)
+   
+   # UPDATE with your findings (adjust fields to your agent's role):
+   state['paper_context']['dependencies'].extend(['package1', 'package2'])
+   state['files_created']['your_agent_name'] = ['file1.py', 'file2.py']
+   state['reproduce_steps'].append('python your_script.py')
+   
+   # WRITE BACK - THIS IS CRITICAL
+   with open('/workspace/shared_state/shared_state.json', 'w') as f:
+       json.dump(state, f, indent=2)
+   
+   print("Updated shared state successfully")
+   ```
 
-with open('/workspace/shared_state/shared_state.json', 'w') as f:
-    json.dump(state, f, indent=2)
-```
+⚠️ IMPORTANT: You MUST execute the Python code to update shared_state.json.
+Writing the code block without running it does NOT update the state.
+The next agent depends on reading your updates from this file.
 """
 
 
@@ -115,10 +129,25 @@ Your tasks include:
 - Loading pre-trained models (RoBERTa, T5, BERT, DeBERTa, Vision Models, etc.)
 - Setting up datasets (GLUE, SQuAD, ImageNet variants, CIFAR, etc.)
 - Handling train/dev/test splits
-- Setting up custom datasets (MuJoCo environments, etc.)
+- Setting up CUSTOM ENVIRONMENTS (MuJoCo, Gym, custom RL environments)
+- Creating ENVIRONMENT WRAPPERS for modified environments (sparse rewards, etc.)
+- Implementing observation normalization for RL environments
 - Validating that models and datasets are correctly loaded
 
-You should use HuggingFace Transformers, PyTorch, and the datasets library where appropriate.
+IMPORTANT for RL papers:
+If the paper uses custom or modified environments (like "Sparse HalfCheetah", "Selfish Mining", 
+"Network Defense"), you MUST implement these as environment wrappers:
+```python
+class SparseRewardWrapper(gym.Wrapper):
+    \"\"\"Wrapper to make environment rewards sparse.\"\"\"
+    def step(self, action):
+        obs, reward, done, truncated, info = self.env.step(action)
+        # Modify reward to be sparse
+        sparse_reward = reward if done else 0.0
+        return obs, sparse_reward, done, truncated, info
+```
+
+You should use HuggingFace Transformers, PyTorch, Gymnasium, and relevant libraries.
 {SUBMISSION_GUIDELINES}
 {SHARED_MEMORY_INSTRUCTIONS}
 
@@ -175,16 +204,71 @@ Previous agent (Infrastructure) status: {"⚠️ FAILED - see recovery steps bel
 Steps:
 1. {"FIRST: Complete recovery steps above, THEN proceed" if infra_failed else "READ /workspace/shared_state/shared_state.json to see models/datasets identified by Infrastructure Agent"}
 2. Identify all models mentioned in the paper (read {paper_path}/paper.md if needed)
-3. Identify all datasets mentioned in the paper
+3. Identify all datasets AND ENVIRONMENTS mentioned in the paper
 4. Write Python scripts that will download models at runtime (NOT save actual model files)
 5. Write Python scripts that will download datasets at runtime (NOT save actual data files)
 6. Handle train/dev/test splits as specified in the paper
-7. Validate that your loading scripts work correctly (test loading a sample)
-8. Create data loading scripts in {submission_path}
-9. UPDATE /workspace/shared_state/shared_state.json with:
+7. FOR RL PAPERS - Create environment wrappers if the paper uses custom environments:
+   ```python
+   # environments.py - Custom environment implementations
+   import gymnasium as gym
+   import numpy as np
+   
+   class SparseRewardWrapper(gym.Wrapper):
+       \"\"\"Make environment rewards sparse (only at episode end).\"\"\"
+       def __init__(self, env):
+           super().__init__(env)
+           self._accumulated_reward = 0.0
+       
+       def step(self, action):
+           obs, reward, terminated, truncated, info = self.env.step(action)
+           self._accumulated_reward += reward
+           if terminated or truncated:
+               sparse_reward = self._accumulated_reward
+               self._accumulated_reward = 0.0
+           else:
+               sparse_reward = 0.0
+           return obs, sparse_reward, terminated, truncated, info
+   
+   class ObservationNormalizationWrapper(gym.Wrapper):
+       \"\"\"Normalize observations using running statistics.\"\"\"
+       def __init__(self, env, clip=10.0):
+           super().__init__(env)
+           self.clip = clip
+           self.mean = np.zeros(env.observation_space.shape)
+           self.var = np.ones(env.observation_space.shape)
+           self.count = 0
+       
+       def step(self, action):
+           obs, reward, terminated, truncated, info = self.env.step(action)
+           self.update_stats(obs)
+           normalized_obs = self.normalize(obs)
+           return normalized_obs, reward, terminated, truncated, info
+       
+       def update_stats(self, obs):
+           self.count += 1
+           delta = obs - self.mean
+           self.mean += delta / self.count
+           self.var += delta * (obs - self.mean)
+       
+       def normalize(self, obs):
+           std = np.sqrt(self.var / max(self.count, 1)) + 1e-8
+           return np.clip((obs - self.mean) / std, -self.clip, self.clip)
+   
+   def make_sparse_env(env_name):
+       \"\"\"Create a sparse reward version of an environment.\"\"\"
+       env = gym.make(env_name)
+       env = SparseRewardWrapper(env)
+       env = ObservationNormalizationWrapper(env)
+       return env
+   ```
+8. Validate that your loading scripts work correctly (test loading a sample)
+9. Create data loading scripts in {submission_path}
+10. UPDATE /workspace/shared_state/shared_state.json with:
    - files_created.model_dataset: list of files you created
    - paper_context.models: list of models identified
    - paper_context.datasets: list of datasets identified
+   - paper_context.environments: list of RL environments (if applicable)
    - reproduce_steps: add commands to download models/datasets
    {"- paper_context.dependencies: packages you installed (from recovery)" if infra_failed else ""}
 
@@ -282,16 +366,47 @@ Before writing any code, thoroughly scan the paper to find ALL algorithms that n
        print("Smoke test passed!")
    ```
 
-5. UPDATE /workspace/shared_state/shared_state.json with:
-   - paper_context.all_algorithms: complete list of ALL algorithms found in paper
-   - paper_context.implemented_algorithms: list of what you actually implemented
-   - paper_context.missing_algorithms: any algorithms you couldn't implement (with reason)
-   - files_created.method_implementation: list of .py files created
+5. MANDATORY - Update shared_state.json by RUNNING this code:
+   ```python
+   import json
+   
+   # Read current state
+   with open('/workspace/shared_state/shared_state.json', 'r') as f:
+       state = json.load(f)
+   
+   # UPDATE with your findings - use actual algorithm names you found
+   state['paper_context']['all_algorithms'] = [
+       'MainMethod',  # Replace with actual method name
+       'Baseline1',   # Replace with actual baselines
+       'Baseline2',
+       'Variant1'
+   ]
+   state['paper_context']['implemented_algorithms'] = [
+       'MainMethod',  # List only what you actually implemented
+       'Baseline1'
+   ]
+   state['paper_context']['baseline_algorithms'] = ['Baseline1', 'Baseline2']
+   state['files_created']['method_implementation'] = [
+       'main_method.py',
+       'baseline1.py',
+       # Add all files you created
+   ]
+   
+   # Write back
+   with open('/workspace/shared_state/shared_state.json', 'w') as f:
+       json.dump(state, f, indent=2)
+   
+   print("Updated shared_state.json with algorithm information")
+   ```
+
+⚠️ CRITICAL: You MUST EXECUTE the Python code above (not just write it).
+The next agent reads shared_state.json to know what methods are available.
 
 DO NOT:
 - Skip baselines because "they're not the main contribution" - IMPLEMENT ALL
 - Create config entries for methods without implementing the actual code
 - Move on until you've checked off ALL items in your checklist
+- Forget to run the shared_state.json update code
 
 The grading will check that ALL methods mentioned in experiments are implemented, not just the main method.
 
@@ -306,14 +421,17 @@ class ExperimentConfigAgent(BaseAgent):
         return f"""You are an Experiment Config Agent responsible for configuring experiments.
 
 Your tasks include:
-- Configuring learning rates, batch sizes, epochs
+- Extracting EXACT parameter combinations from paper tables
+- Configuring learning rates, batch sizes, epochs for EACH table row
 - Configuring optimizers (Adam, Adam+L-BFGS, etc.)
-- Configuring seeds for reproducibility
-- Configuring sparsities, coreset sizes, network widths
-- Configuring distillation schedules
-- Creating configuration files (YAML/JSON)
+- Configuring seeds for reproducibility (multiple seeds per experiment)
+- Creating configuration files (YAML/JSON) for ALL experiment variants
 
-You should create comprehensive configuration files that match the paper's experimental setup.
+CRITICAL: Papers test SPECIFIC parameter combinations. If Table 2 shows results for 
+dimensions D ∈ {{4, 16, 64, 256}} with batch sizes B ∈ {{2, 15, 150}}, you must create 
+configs for EACH combination that appears in the table, not just one example.
+
+You should create comprehensive configuration files that match the paper's experimental setup EXACTLY.
 {SUBMISSION_GUIDELINES}
 {SHARED_MEMORY_INSTRUCTIONS}
 """
@@ -335,18 +453,55 @@ Previous agents have set up infrastructure, loaded models/datasets, and implemen
 
 {shared_context}
 
-Steps:
-1. READ /workspace/shared_state/shared_state.json to see files created and methods implemented
-2. Read the paper to identify all experimental configurations
-3. Extract hyperparameters (learning rates, batch sizes, epochs, etc.)
-4. Extract optimizer settings and seed configurations
-5. Create configuration files (config.yaml or config.json) in {submission_path}
-6. Document configuration choices and their sources in the paper
-7. UPDATE /workspace/shared_state/shared_state.json with:
-   - files_created.experiment_config: list of config files you created
-   - paper_context.experiments: list of experiments to run
+CRITICAL FIRST STEP - Extract ALL Parameter Combinations from Tables:
+1. Read {paper_path}/paper.md and find ALL experiment tables (Table 1, 2, 3, etc.)
+2. For EACH table, extract the EXACT parameter combinations tested:
+   - Look for patterns like "D ∈ {{4, 16, 64, 256}}" or "dimensions: 4, 16, 64, 256"
+   - Look for "batch size B ∈ {{2, 15, 150}}" or "B = 2, 15, 150"
+   - Look for "learning rates: 1e-4, 1e-3, 1e-2" or "lr grid search"
+   - Look for "seeds: 1-10" or "averaged over 10 runs"
+3. Create a CONFIG for EACH combination that appears in results
 
-Use the paper's tables and figures as references. Create configurations for all experiments described.
+Example: If Table 2 shows BaM results for (D=4, B=2), (D=16, B=15), (D=256, B=150):
+```yaml
+experiments:
+  - name: "bam_d4_b2"
+    algorithm: "bam"
+    dimension: 4
+    batch_size: 2
+    iterations: 10000
+    seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    
+  - name: "bam_d16_b15"
+    algorithm: "bam"
+    dimension: 16
+    batch_size: 15
+    iterations: 10000
+    seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    
+  - name: "bam_d256_b150"
+    algorithm: "bam"
+    dimension: 256
+    batch_size: 150
+    iterations: 10000
+    seeds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+```
+
+Steps:
+1. READ /workspace/shared_state/shared_state.json to see implemented algorithms
+2. Scan paper for ALL tables showing experimental results
+3. Extract EVERY unique parameter combination from each table
+4. For methods requiring hyperparameter search (like learning rate), include the grid:
+   ```yaml
+   learning_rate_grid: [0.0001, 0.001, 0.01, 0.1]
+   ```
+5. Include multiple seeds for reproducibility (typically 5-10 seeds)
+6. Create comprehensive config files in {submission_path}
+7. UPDATE /workspace/shared_state/shared_state.json with:
+   - files_created.experiment_config: list of config files created
+   - paper_context.experiments: list of ALL experiment configurations
+
+DO NOT just create one example config - create configs for ALL parameter combinations in the paper's tables.
 
 REMEMBER: Only save .yaml, .json, or .py config files to {submission_path}. Keep configs lightweight.
 """
@@ -486,10 +641,15 @@ class MetricsEvaluationAgent(BaseAgent):
 Your tasks include:
 - Calculating accuracy metrics (Top-1, Top-5, dev set accuracy)
 - Calculating F1 score, ROUGE scores
-- Calculating L2RE, ECE, Exact Match Drop ratios
+- Calculating KL divergence (forward and reverse), L2RE, ECE
 - Measuring training metrics (time-to-accuracy, GPU memory, inference throughput)
 - Calculating correlation metrics (R², Pearson correlation)
+- Implementing PER-ITERATION metric logging for convergence plots
 - Implementing evaluation harnesses
+
+CRITICAL: Many papers show CONVERGENCE PLOTS with metrics at each iteration.
+If the paper has figures showing "KL divergence vs iteration" or "loss vs epoch",
+you MUST implement per-iteration logging, not just final metrics.
 
 You should calculate all metrics mentioned in the paper and validate their correctness.
 {SUBMISSION_GUIDELINES}
@@ -520,13 +680,82 @@ Task: {task_desc}
 
 Previous agents have set up infrastructure, loaded models/datasets, implemented methods, configured experiments, and run experiments.
 {shared_context_block}
-Steps:
-1. Identify all metrics mentioned in the paper
-2. Write evaluation scripts that calculate accuracy, F1, ROUGE, L2RE, ECE, and other metrics
-3. Write scripts to measure training metrics (time, memory, throughput)
-4. Write scripts to calculate correlation metrics if needed
-5. Save evaluation SCRIPTS (not outputs) to {submission_path}
-6. Ensure reproduce.sh will run these evaluation scripts
+
+STEP 1 - Identify ALL Metrics:
+Read {paper_path}/paper.md and list EVERY metric mentioned:
+- Final metrics (accuracy, F1, KL divergence at end)
+- Per-iteration metrics (for convergence plots)
+- Statistical metrics (mean, std over multiple seeds)
+
+STEP 2 - Check for Convergence Plots:
+If the paper has figures showing metrics over iterations (e.g., "Figure 2: KL divergence vs iteration"):
+- You MUST implement per-iteration logging
+- Metrics should be recorded at regular intervals during training
+
+Example per-iteration logging implementation:
+```python
+def run_with_metrics_logging(algorithm, target, num_iterations, log_every=100):
+    \"\"\"Run algorithm and log metrics at each interval.\"\"\"
+    history = {{
+        "iteration": [],
+        "kl_forward": [],
+        "kl_reverse": [],
+        "loss": []
+    }}
+    
+    for i in range(num_iterations):
+        algorithm.step(...)
+        
+        if i % log_every == 0 or i == num_iterations - 1:
+            # Compute metrics at this iteration
+            kl_fwd = compute_kl_forward(algorithm.get_params(), target)
+            kl_rev = compute_kl_reverse(algorithm.get_params(), target)
+            
+            history["iteration"].append(i)
+            history["kl_forward"].append(float(kl_fwd))
+            history["kl_reverse"].append(float(kl_rev))
+    
+    return history
+
+def compute_kl_forward(q_params, p_target):
+    \"\"\"KL(q || p) - forward KL divergence.\"\"\"
+    # For Gaussians: 0.5 * (tr(Σp⁻¹Σq) + (μp-μq)ᵀΣp⁻¹(μp-μq) - d + ln(|Σp|/|Σq|))
+    ...
+
+def compute_kl_reverse(q_params, p_target):
+    \"\"\"KL(p || q) - reverse KL divergence.\"\"\"
+    ...
+```
+
+STEP 3 - Implement Metric Functions:
+Create {submission_path}/eval_metrics.py with:
+- compute_kl_forward(q, p) - Forward KL divergence
+- compute_kl_reverse(q, p) - Reverse KL divergence  
+- compute_accuracy(predictions, labels)
+- compute_f1(predictions, labels)
+- Any other metrics mentioned in the paper
+
+STEP 4 - Integrate with Training:
+Ensure run_experiment.py calls the logging functions:
+```python
+# In the main training loop
+history = run_with_metrics_logging(algorithm, target, config["iterations"])
+
+# Save history for analysis
+with open(output_path / "metrics_history.json", "w") as f:
+    json.dump(history, f)
+```
+
+STEP 5 - Update shared state:
+```python
+import json
+with open('/workspace/shared_state/shared_state.json', 'r') as f:
+    state = json.load(f)
+state['paper_context']['metrics'] = ['kl_forward', 'kl_reverse', 'accuracy', ...]
+state['files_created']['metrics_evaluation'] = ['eval_metrics.py', ...]
+with open('/workspace/shared_state/shared_state.json', 'w') as f:
+    json.dump(state, f, indent=2)
+```
 
 {SHARED_MEMORY_INSTRUCTIONS}
 
